@@ -1,3 +1,5 @@
 .venv-vllm-metal/
 *.log
 __pycache__/
+vllm_metrics.db
+dashboard.html
