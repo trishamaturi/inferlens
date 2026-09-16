@@ -1,10 +1,12 @@
 """
-Phase 0, step 2: run vLLM as an OpenAI-compatible server, fire every prompt
-from basic_test.py at it *concurrently* as its own streamed request, and
-record what happened -- both the engine-wide Prometheus /metrics timeline
-and the true per-request timing (TTFT/ITL/E2E measured client-side from the
-SSE stream, not approximated from engine aggregates) -- into vllm_metrics.db
-for build_dashboard.py to render.
+Phase 0/2: run vLLM as an OpenAI-compatible server, fire every prompt from
+basic_test.py at it *concurrently* as its own streamed request, and record
+what happened from three sources: the engine-wide Prometheus /metrics
+timeline, real per-request timing measured client-side over the SSE stream
+(TTFT/ITL/E2E, not approximated from engine aggregates), and the real
+server-side OpenTelemetry span vLLM exports per request (queue/prefill/
+decode phase breakdown, via --otlp-traces-endpoint) -- all into
+vllm_metrics.db for build_dashboard.py to render.
 
 Also renders the run straight to dashboard.html afterwards (see
 build_dashboard.py) so one command gets you from a cold server to a
@@ -19,6 +21,7 @@ Or via the helper script from this directory:
 """
 
 import json
+import os
 import subprocess
 import threading
 import time
@@ -32,12 +35,16 @@ import requests
 import metrics_db
 from basic_test import CONVERSATIONS, MODEL, RAW_PROMPTS
 from build_dashboard import render_dashboard
+from otel_receiver import OtelSpanReceiver
 
 HOST = "127.0.0.1"
 PORT = 8000
 BASE_URL = f"http://{HOST}:{PORT}"
+OTEL_HOST = "127.0.0.1"
+OTEL_PORT = 4318
 STARTUP_TIMEOUT_S = 300
 POLL_INTERVAL_S = 0.2
+OTEL_FLUSH_GRACE_S = 2.0
 
 # Golden-signal metrics (see PLAN.md phase 0): queue depth, KV cache %,
 # token throughput, and the latency histograms behind TTFT/ITL/e2e.
@@ -136,6 +143,7 @@ def stream_request(path: str, payload: dict, start_time: float) -> dict:
     submitted_t = time.monotonic() - start_time
     token_times: list[float] = []
     prompt_tokens = completion_tokens = None
+    server_request_id = None
     is_chat = "chat" in path
 
     with requests.post(f"{BASE_URL}{path}", json=payload, stream=True, timeout=120) as resp:
@@ -147,6 +155,8 @@ def stream_request(path: str, payload: dict, start_time: float) -> dict:
             if data == "[DONE]":
                 break
             chunk = json.loads(data)
+            if server_request_id is None:
+                server_request_id = chunk.get("id")
             choices = chunk.get("choices") or []
             if choices:
                 delta_text = (
@@ -177,6 +187,7 @@ def stream_request(path: str, payload: dict, start_time: float) -> dict:
         "itl_ms": itl_ms,
         "e2e_ms": e2e_ms,
         "token_times": token_times,
+        "server_request_id": server_request_id,
     }
 
 
@@ -229,7 +240,17 @@ def run_all_queries(start_time: float) -> list[dict]:
 
 
 def main() -> None:
-    proc = subprocess.Popen(["vllm", "serve", MODEL, "--host", HOST, "--port", str(PORT)])
+    otel_receiver = OtelSpanReceiver(OTEL_HOST, OTEL_PORT)
+    otel_receiver.start()
+
+    vllm_env = {**os.environ, "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf"}
+    proc = subprocess.Popen(
+        [
+            "vllm", "serve", MODEL, "--host", HOST, "--port", str(PORT),
+            "--otlp-traces-endpoint", otel_receiver.endpoint,
+        ],
+        env=vllm_env,
+    )
     poller = MetricsPoller(POLL_INTERVAL_S)
     start_time = time.monotonic()
     try:
@@ -252,6 +273,12 @@ def main() -> None:
             proc.kill()
             proc.wait()
 
+        # vLLM's BatchSpanProcessor flushes remaining spans on process exit
+        # (atexit), which races the shutdown above -- give it a moment to
+        # land on the receiver before we stop listening.
+        time.sleep(OTEL_FLUSH_GRACE_S)
+        otel_receiver.stop()
+
     duration_s = max((t for t, _ in poller.samples), default=0.0)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
 
@@ -262,7 +289,10 @@ def main() -> None:
             metrics_db.insert_request(conn, run_id, result)
             metrics_db.insert_request_tokens(conn, result["request_id"], result["token_times"])
         metrics_db.insert_samples(conn, run_id, poller.samples)
+        metrics_db.insert_otel_spans(conn, run_id, otel_receiver.spans)
     conn.close()
+
+    print(f"Received {len(otel_receiver.spans)} OTel spans over OTLP/HTTP.")
 
     print(
         f"\nWrote run {run_id} ({len(poller.samples)} metric samples, {len(results)} requests) "

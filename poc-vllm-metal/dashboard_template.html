@@ -70,7 +70,12 @@
   .toolbar { font-size: 13px; color: var(--text-secondary); }
   .toolbar strong { color: var(--text-primary); font-weight: 600; }
 
-  .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
+  /* min-height reserves room for the largest KPI-row state (query view with
+     an OTel phase breakdown, which wraps to two rows) so switching between
+     aggregate and per-query KPIs on waterfall hover never shifts the layout
+     below it -- without this, growing the row pushes the waterfall you're
+     hovering right out from under the cursor. */
+  .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; min-height: 184px; align-content: start; }
   .kpi {
     background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
     padding: 12px 14px; box-shadow: var(--shadow);
@@ -572,7 +577,14 @@ function renderQueryKpis(req) {
   const row = document.getElementById("kpi-row");
   row.innerHTML = "";
   row.appendChild(kpiTile("Kind", req.kind));
-  row.appendChild(kpiTile("TTFT", fmtMs(req.ttft_ms)));
+  if (req.otel) {
+    // Server-measured (OTel span) -- the only source that can actually see
+    // time spent waiting in the scheduler queue before prefill even starts.
+    row.appendChild(kpiTile("Queue time (server)", req.otel.queue_ms.toFixed(0), "ms"));
+    row.appendChild(kpiTile("Prefill time (server)", req.otel.prefill_ms.toFixed(0), "ms"));
+    row.appendChild(kpiTile("Decode time (server)", req.otel.decode_ms.toFixed(0), "ms"));
+  }
+  row.appendChild(kpiTile("TTFT (client)", fmtMs(req.ttft_ms)));
   row.appendChild(kpiTile("Inter-token latency", req.itl_ms !== null ? req.itl_ms.toFixed(1) : "—", "ms"));
   row.appendChild(kpiTile("End-to-end latency", fmtMs(req.e2e_ms)));
   row.appendChild(kpiTile("Prompt tokens", req.prompt_tokens ?? "—"));
@@ -612,26 +624,29 @@ function renderSamplesTable(run) {
 function renderRequestsTable(run) {
   const table = document.getElementById("requests-table");
   const cols = [
-    ["label", "query", v => v],
-    ["kind", "kind", v => v],
-    ["submitted_t", "submitted", v => v.toFixed(2) + "s"],
-    ["ttft_ms", "ttft", v => fmtMs(v)],
-    ["itl_ms", "itl", v => v !== null ? v.toFixed(1) + "ms" : "—"],
-    ["e2e_ms", "e2e", v => fmtMs(v)],
-    ["prompt_tokens", "prompt tok", v => v ?? "—"],
-    ["completion_tokens", "completion tok", v => v ?? "—"],
+    ["query", r => r.label],
+    ["kind", r => r.kind],
+    ["submitted", r => r.submitted_t.toFixed(2) + "s"],
+    ["queue (server)", r => r.otel ? r.otel.queue_ms.toFixed(0) + "ms" : "—"],
+    ["prefill (server)", r => r.otel ? r.otel.prefill_ms.toFixed(0) + "ms" : "—"],
+    ["decode (server)", r => r.otel ? r.otel.decode_ms.toFixed(0) + "ms" : "—"],
+    ["ttft (client)", r => fmtMs(r.ttft_ms)],
+    ["itl", r => r.itl_ms !== null ? r.itl_ms.toFixed(1) + "ms" : "—"],
+    ["e2e", r => fmtMs(r.e2e_ms)],
+    ["prompt tok", r => r.prompt_tokens ?? "—"],
+    ["completion tok", r => r.completion_tokens ?? "—"],
   ];
   const thead = document.createElement("thead");
   const htr = document.createElement("tr");
-  cols.forEach(c => { const th = document.createElement("th"); th.textContent = c[1]; htr.appendChild(th); });
+  cols.forEach(([label]) => { const th = document.createElement("th"); th.textContent = label; htr.appendChild(th); });
   thead.appendChild(htr);
   table.appendChild(thead);
   const tbody = document.createElement("tbody");
   run.requests.forEach(r => {
     const tr = document.createElement("tr");
-    cols.forEach(c => {
+    cols.forEach(([, getter]) => {
       const td = document.createElement("td");
-      td.textContent = c[2](r[c[0]]);
+      td.textContent = getter(r);
       tr.appendChild(td);
     });
     tbody.appendChild(tr);
@@ -639,14 +654,16 @@ function renderRequestsTable(run) {
   table.appendChild(tbody);
 }
 
-// ---- request waterfall: one row per query, split into a "waiting for
-// first token" segment and a "generating" segment. This is the view that
-// actually differentiates requests (their offsets/durations/overlap are
-// real distinguishing data); hovering a bar highlights that window on the
-// shared engine charts below and swaps the KPI row to that request's own
-// numbers, per PLAN.md's "click a request, see the metric timeline
-// around it" -- rather than trying to force per-request distinction out
-// of engine metrics that are inherently shared across concurrent requests.
+// ---- request waterfall: one row per query, split into its real
+// queue/prefill/decode phases when an OTel span was captured for it
+// (falls back to a client-only wait/generate split otherwise). This is
+// the view that actually differentiates requests (their offsets,
+// durations, and per-phase breakdown are real distinguishing data);
+// hovering a bar highlights that window on the shared engine charts below
+// and swaps the KPI row to that request's own numbers, per PLAN.md's
+// "click a request, see the metric timeline around it" -- rather than
+// trying to force per-request distinction out of engine metrics that are
+// inherently shared across concurrent requests.
 function renderWaterfall(run, onEnter, onLeave) {
   const mount = document.getElementById("chart-waterfall");
   mount.innerHTML = "";
@@ -662,11 +679,15 @@ function renderWaterfall(run, onEnter, onLeave) {
   const xDomain = [0, run.run.duration_s || 1];
   const xScale = x => margin.left + (x / xDomain[1]) * innerW;
 
-  const waitColor = cssVar("--series-orange"), genColor = cssVar("--series-blue");
+  const queueColor = cssVar("--series-orange"), prefillColor = cssVar("--series-aqua"), decodeColor = cssVar("--series-blue");
+  const hasOtel = rows.some(r => r.otel);
 
+  const legendEntries = hasOtel
+    ? [["queued (server)", queueColor], ["prefill (server)", prefillColor], ["decode (server)", decodeColor]]
+    : [["waiting for first token (client)", queueColor], ["generating (client)", decodeColor]];
   const legend = document.createElement("div");
   legend.className = "legend";
-  [["waiting for first token", waitColor], ["generating", genColor]].forEach(([label, color]) => {
+  legendEntries.forEach(([label, color]) => {
     const item = document.createElement("div");
     item.className = "legend-item";
     const key = document.createElement("span");
@@ -703,12 +724,19 @@ function renderWaterfall(run, onEnter, onLeave) {
     timeEl.className = "t-time";
     timeEl.textContent = `[${req.kind}] ${req.label}`;
     tooltip.appendChild(timeEl);
-    [
-      ["TTFT", fmtMs(req.ttft_ms)],
+    const rowsData = req.otel
+      ? [
+          ["Queue (server)", req.otel.queue_ms.toFixed(0) + "ms"],
+          ["Prefill (server)", req.otel.prefill_ms.toFixed(0) + "ms"],
+          ["Decode (server)", req.otel.decode_ms.toFixed(0) + "ms"],
+        ]
+      : [["TTFT (client)", fmtMs(req.ttft_ms)]];
+    rowsData.push(
       ["Inter-token latency", req.itl_ms !== null ? req.itl_ms.toFixed(1) + "ms" : "—"],
       ["End-to-end", fmtMs(req.e2e_ms)],
       ["Tokens", `${req.prompt_tokens ?? "—"} in / ${req.completion_tokens ?? "—"} out`],
-    ].forEach(([label, value]) => {
+    );
+    rowsData.forEach(([label, value]) => {
       const row = document.createElement("div");
       row.className = "t-row";
       const lbl = document.createElement("span");
@@ -741,19 +769,34 @@ function renderWaterfall(run, onEnter, onLeave) {
     svg.appendChild(label);
 
     const t0 = req.submitted_t;
-    const t1 = req.first_token_t ?? req.completed_t;
     const t2 = req.completed_t;
     const midX = (xScale(t0) + xScale(t2)) / 2;
 
-    const waitRect = el("rect", {
-      x: xScale(t0), y: y - barH / 2, width: Math.max(1, xScale(t1) - xScale(t0)), height: barH,
-      fill: waitColor, rx: 3, tabindex: 0,
-    });
-    const genRect = el("rect", {
-      x: xScale(t1), y: y - barH / 2, width: Math.max(1, xScale(t2) - xScale(t1)), height: barH,
-      fill: genColor, rx: 3, tabindex: 0,
-    });
-    [waitRect, genRect].forEach(rect => {
+    // With a real OTel span, anchor its server-measured phase durations at
+    // this request's own submitted_t (client and server clocks aren't the
+    // same clock, so absolute span timestamps can't be overlaid directly --
+    // but the *durations* are real regardless of which clock measured them).
+    const segments = req.otel
+      ? (() => {
+          const queueEnd = t0 + req.otel.queue_ms / 1000;
+          const prefillEnd = queueEnd + req.otel.prefill_ms / 1000;
+          const decodeEnd = prefillEnd + req.otel.decode_ms / 1000;
+          return [
+            [t0, queueEnd, queueColor],
+            [queueEnd, prefillEnd, prefillColor],
+            [prefillEnd, decodeEnd, decodeColor],
+          ];
+        })()
+      : [
+          [t0, req.first_token_t ?? t2, queueColor],
+          [req.first_token_t ?? t2, t2, decodeColor],
+        ];
+
+    segments.forEach(([segStart, segEnd, color]) => {
+      const rect = el("rect", {
+        x: xScale(segStart), y: y - barH / 2, width: Math.max(1, xScale(segEnd) - xScale(segStart)), height: barH,
+        fill: color, rx: 3, tabindex: 0,
+      });
       rect.addEventListener("pointerenter", () => activate(req, midX));
       rect.addEventListener("focus", () => activate(req, midX));
       rect.addEventListener("pointerleave", deactivate);

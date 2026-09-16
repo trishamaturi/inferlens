@@ -1,13 +1,15 @@
 """
 SQLite storage for vLLM run data: one row per /metrics scrape sample
-(long format: run/t/metric_name/value) and one row per query fired at the
-server, with real per-request timing measured client-side over streaming
-responses (see metrics_test.py).
+(long format: run/t/metric_name/value), one row per query fired at the
+server with real per-request timing measured client-side over streaming
+responses, and one row per OpenTelemetry span vLLM exports server-side
+(see metrics_test.py and otel_receiver.py).
 
 Multiple runs accumulate in the same DB file (vllm_metrics.db, gitignored)
 so build_dashboard.py can render whichever run you want.
 """
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -33,7 +35,8 @@ CREATE TABLE IF NOT EXISTS requests (
     completion_tokens INTEGER,
     ttft_ms REAL,
     itl_ms REAL,
-    e2e_ms REAL
+    e2e_ms REAL,
+    server_request_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS metric_samples (
@@ -52,9 +55,27 @@ CREATE TABLE IF NOT EXISTS request_tokens (
     t REAL NOT NULL
 );
 
+-- One row per OpenTelemetry span vLLM exported over OTLP/HTTP (see
+-- otel_receiver.py). gen_ai_request_id is vLLM's own internal request id,
+-- which is the same string returned as the OpenAI response's "id" field
+-- (requests.server_request_id) -- that's the join key back to our own
+-- per-request rows, since our request_id is a UUID we generate client-side.
+CREATE TABLE IF NOT EXISTS otel_spans (
+    run_id TEXT NOT NULL REFERENCES runs(run_id),
+    trace_id TEXT NOT NULL,
+    span_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    start_time_unix_nano INTEGER NOT NULL,
+    end_time_unix_nano INTEGER NOT NULL,
+    gen_ai_request_id TEXT,
+    attributes_json TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_requests_run ON requests(run_id);
 CREATE INDEX IF NOT EXISTS idx_samples_run_t ON metric_samples(run_id, t);
 CREATE INDEX IF NOT EXISTS idx_tokens_request ON request_tokens(request_id);
+CREATE INDEX IF NOT EXISTS idx_otel_spans_run ON otel_spans(run_id);
+CREATE INDEX IF NOT EXISTS idx_otel_spans_request ON otel_spans(gen_ai_request_id);
 """
 
 
@@ -75,12 +96,12 @@ def insert_request(conn: sqlite3.Connection, run_id: str, req: dict) -> None:
     conn.execute(
         """INSERT INTO requests
            (request_id, run_id, kind, label, submitted_t, first_token_t, completed_t,
-            prompt_tokens, completion_tokens, ttft_ms, itl_ms, e2e_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            prompt_tokens, completion_tokens, ttft_ms, itl_ms, e2e_ms, server_request_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             req["request_id"], run_id, req["kind"], req["label"], req["submitted_t"],
             req["first_token_t"], req["completed_t"], req["prompt_tokens"], req["completion_tokens"],
-            req["ttft_ms"], req["itl_ms"], req["e2e_ms"],
+            req["ttft_ms"], req["itl_ms"], req["e2e_ms"], req.get("server_request_id"),
         ),
     )
 
@@ -93,6 +114,25 @@ def insert_samples(conn: sqlite3.Connection, run_id: str, samples: list[tuple[fl
 def insert_request_tokens(conn: sqlite3.Connection, request_id: str, token_times: list[float]) -> None:
     rows = [(request_id, idx, t) for idx, t in enumerate(token_times, start=1)]
     conn.executemany("INSERT INTO request_tokens (request_id, idx, t) VALUES (?, ?, ?)", rows)
+
+
+def insert_otel_spans(conn: sqlite3.Connection, run_id: str, spans: list[dict]) -> None:
+    rows = [
+        (
+            run_id, span["trace_id"], span["span_id"], span["name"],
+            span["start_time_unix_nano"], span["end_time_unix_nano"],
+            span["attributes"].get("gen_ai.request.id"),
+            json.dumps(span["attributes"]),
+        )
+        for span in spans
+    ]
+    conn.executemany(
+        """INSERT INTO otel_spans
+           (run_id, trace_id, span_id, name, start_time_unix_nano, end_time_unix_nano,
+            gen_ai_request_id, attributes_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
 
 
 def latest_run_id(conn: sqlite3.Connection) -> str | None:
@@ -109,7 +149,7 @@ def fetch_run(conn: sqlite3.Connection, run_id: str):
 
     request_rows = conn.execute(
         """SELECT request_id, kind, label, submitted_t, first_token_t, completed_t,
-                  prompt_tokens, completion_tokens, ttft_ms, itl_ms, e2e_ms
+                  prompt_tokens, completion_tokens, ttft_ms, itl_ms, e2e_ms, server_request_id
            FROM requests WHERE run_id = ? ORDER BY submitted_t""",
         (run_id,),
     ).fetchall()
@@ -129,4 +169,13 @@ def fetch_run(conn: sqlite3.Connection, run_id: str):
     for request_id, t in token_rows:
         tokens_by_request.setdefault(request_id, []).append(t)
 
-    return run, request_rows, sample_rows, tokens_by_request
+    span_rows = conn.execute(
+        """SELECT gen_ai_request_id, attributes_json FROM otel_spans
+           WHERE run_id = ? AND gen_ai_request_id IS NOT NULL""",
+        (run_id,),
+    ).fetchall()
+    otel_by_server_request_id: dict[str, dict] = {
+        server_request_id: json.loads(attrs_json) for server_request_id, attrs_json in span_rows
+    }
+
+    return run, request_rows, sample_rows, tokens_by_request, otel_by_server_request_id

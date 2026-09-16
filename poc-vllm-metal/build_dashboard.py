@@ -27,13 +27,31 @@ def pivot_samples(sample_rows: list[tuple[float, str, float]]) -> list[dict]:
     return [by_t[t] for t in sorted(by_t)]
 
 
+def otel_phases_ms(otel_attrs: dict | None) -> dict | None:
+    """Convert vLLM's server-measured gen_ai.latency.* span attributes
+    (seconds) into the ms phase breakdown the waterfall draws -- this is
+    real engine-side queue/prefill/decode timing, not something a client
+    can reconstruct from the outside."""
+    if not otel_attrs:
+        return None
+    return {
+        "queue_ms": otel_attrs.get("gen_ai.latency.time_in_queue", 0) * 1000,
+        "prefill_ms": otel_attrs.get("gen_ai.latency.time_in_model_prefill", 0) * 1000,
+        "decode_ms": otel_attrs.get("gen_ai.latency.time_in_model_decode", 0) * 1000,
+        "ttft_ms": otel_attrs.get("gen_ai.latency.time_to_first_token", 0) * 1000,
+        "e2e_ms": otel_attrs.get("gen_ai.latency.e2e", 0) * 1000,
+    }
+
+
 def build_payload(run_id: str | None, db_path: Path) -> dict:
     conn = metrics_db.connect(db_path)
     try:
         run_id = run_id or metrics_db.latest_run_id(conn)
         if run_id is None:
             raise SystemExit(f"No runs recorded yet in {db_path} -- run metrics_test.py first.")
-        run, request_rows, sample_rows, tokens_by_request = metrics_db.fetch_run(conn, run_id)
+        run, request_rows, sample_rows, tokens_by_request, otel_by_server_request_id = metrics_db.fetch_run(
+            conn, run_id
+        )
     finally:
         conn.close()
 
@@ -44,6 +62,12 @@ def build_payload(run_id: str | None, db_path: Path) -> dict:
             "first_token_t": r[4], "completed_t": r[5], "prompt_tokens": r[6],
             "completion_tokens": r[7], "ttft_ms": r[8], "itl_ms": r[9], "e2e_ms": r[10],
             "token_times": tokens_by_request.get(r[0], []),
+            # /v1/completions spans get an index suffix ("-0") appended to
+            # the request id per prompt-in-batch, even for a single prompt;
+            # /v1/chat/completions spans don't. Try both.
+            "otel": otel_phases_ms(
+                otel_by_server_request_id.get(r[11]) or otel_by_server_request_id.get(f"{r[11]}-0")
+            ),
         }
         for r in request_rows
     ]
