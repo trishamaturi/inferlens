@@ -12,14 +12,21 @@ Also renders the run straight to dashboard.html afterwards (see
 build_dashboard.py) so one command gets you from a cold server to a
 viewable page.
 
+By default this fires basic_test.py's 8-prompt smoke test, which never
+queues or contends for anything -- pass --stress to fire stress_workload.py's
+scheduler-overloading mix instead (many concurrent short requests plus
+long-context "hog" requests, with a low --max-num-seqs cap), which is what
+actually produces queueing/KV-pressure signal for the dashboard to show.
+
 Run inside the vllm-metal venv:
     source ~/.venv-vllm-metal/bin/activate
-    python metrics_test.py
+    python metrics_test.py [--stress] [--max-num-seqs N]
 
 Or via the helper script from this directory:
-    ./run_metrics.sh
+    ./run_metrics.sh [--stress] [--max-num-seqs N]
 """
 
+import argparse
 import json
 import os
 import subprocess
@@ -36,6 +43,7 @@ import metrics_db
 from basic_test import CONVERSATIONS, MODEL, RAW_PROMPTS
 from build_dashboard import render_dashboard
 from otel_receiver import OtelSpanReceiver
+from stress_workload import build_stress_jobs
 
 HOST = "127.0.0.1"
 PORT = 8000
@@ -146,7 +154,7 @@ def stream_request(path: str, payload: dict, start_time: float) -> dict:
     server_request_id = None
     is_chat = "chat" in path
 
-    with requests.post(f"{BASE_URL}{path}", json=payload, stream=True, timeout=120) as resp:
+    with requests.post(f"{BASE_URL}{path}", json=payload, stream=True, timeout=300) as resp:
         resp.raise_for_status()
         for line in resp.iter_lines(decode_unicode=True):
             if not line or not line.startswith("data: "):
@@ -219,11 +227,22 @@ def chat_job(messages: list[dict]) -> tuple[str, str, str, dict]:
     return "chat", label, "/v1/chat/completions", payload
 
 
-def run_all_queries(start_time: float) -> list[dict]:
-    """Fires every prompt/conversation as its own concurrent streamed
-    request, so the server actually sees the multi-session load PLAN.md is
-    about, and each query gets its own real (not engine-averaged) timing."""
-    jobs = [completion_job(p) for p in RAW_PROMPTS] + [chat_job(c) for c in CONVERSATIONS]
+def stress_job(job: dict) -> tuple[str, str, str, dict]:
+    payload = {
+        "model": MODEL,
+        "prompt": job["prompt"],
+        "temperature": 0.7,
+        "max_tokens": job["max_tokens"],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    return job["kind"], job["label"], "/v1/completions", payload
+
+
+def run_all_queries(start_time: float, jobs: list[tuple[str, str, str, dict]]) -> list[dict]:
+    """Fires every job as its own concurrent streamed request, so the
+    server actually sees the multi-session load PLAN.md is about, and each
+    query gets its own real (not engine-averaged) timing."""
     results = []
     with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
         futures = {
@@ -239,18 +258,35 @@ def run_all_queries(start_time: float) -> list[dict]:
     return results
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--stress", action="store_true",
+        help="Fire stress_workload.py's scheduler-overloading mix instead of basic_test.py's smoke-test prompts.",
+    )
+    parser.add_argument(
+        "--max-num-seqs", type=int, default=None,
+        help="Cap vLLM's scheduler batch size (passed through to `vllm serve`). "
+        "Defaults to 4 with --stress (to force real queueing), otherwise left at vLLM's own default.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+    max_num_seqs = args.max_num_seqs if args.max_num_seqs is not None else (4 if args.stress else None)
+
     otel_receiver = OtelSpanReceiver(OTEL_HOST, OTEL_PORT)
     otel_receiver.start()
 
     vllm_env = {**os.environ, "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf"}
-    proc = subprocess.Popen(
-        [
-            "vllm", "serve", MODEL, "--host", HOST, "--port", str(PORT),
-            "--otlp-traces-endpoint", otel_receiver.endpoint,
-        ],
-        env=vllm_env,
-    )
+    serve_cmd = [
+        "vllm", "serve", MODEL, "--host", HOST, "--port", str(PORT),
+        "--otlp-traces-endpoint", otel_receiver.endpoint,
+    ]
+    if max_num_seqs is not None:
+        serve_cmd += ["--max-num-seqs", str(max_num_seqs)]
+    proc = subprocess.Popen(serve_cmd, env=vllm_env)
     poller = MetricsPoller(POLL_INTERVAL_S)
     start_time = time.monotonic()
     try:
@@ -259,7 +295,12 @@ def main() -> None:
         print("Server is healthy. Starting metrics poller and firing all queries concurrently.")
         poller.start(start_time)
 
-        results = run_all_queries(start_time)
+        if args.stress:
+            jobs = [stress_job(j) for j in build_stress_jobs()]
+            print(f"Stress mode: firing {len(jobs)} concurrent requests against max-num-seqs={max_num_seqs}.")
+        else:
+            jobs = [completion_job(p) for p in RAW_PROMPTS] + [chat_job(c) for c in CONVERSATIONS]
+        results = run_all_queries(start_time, jobs)
 
         # A few extra samples so the tail of the run (post-request settling)
         # shows up in the chart too.
