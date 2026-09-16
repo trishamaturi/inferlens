@@ -11,8 +11,11 @@ Demonstrates the two distinct modes:
     expects for question-answering.
 
 Run inside the vllm-metal venv:
-    source .venv-vllm-metal/bin/activate
-    python hello_vllm.py
+    source ~/.venv-vllm-metal/bin/activate
+    python basic_test.py
+
+Or via the helper script from this directory:
+    ./run.sh
 """
 
 from vllm import LLM, SamplingParams
