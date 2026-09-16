@@ -67,17 +67,8 @@
     padding: 1px 6px; border-radius: 4px; color: var(--text-primary);
   }
 
-  .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .toolbar label { font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
-  .toolbar select {
-    font: inherit; font-size: 13px; color: var(--text-primary); background: var(--surface-1);
-    border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; min-width: 260px;
-  }
-  .toolbar select:focus-visible { outline: 2px solid var(--series-blue); outline-offset: 1px; }
-  .toolbar .scope-badge {
-    font-size: 11px; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--border);
-    color: var(--text-secondary); background: var(--surface-1);
-  }
+  .toolbar { font-size: 13px; color: var(--text-secondary); }
+  .toolbar strong { color: var(--text-primary); font-weight: 600; }
 
   .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
   .kpi {
@@ -110,6 +101,7 @@
   .series-area { stroke: none; opacity: 0.12; }
   .end-dot { stroke-width: 2; }
   .end-label { font-size: 11px; font-weight: 600; font-family: system-ui, sans-serif; }
+  .highlight-band { fill: var(--series-blue); opacity: 0.10; }
   .crosshair-line { stroke: var(--baseline); stroke-width: 1; pointer-events: none; }
   .hover-dot { stroke-width: 2; pointer-events: none; }
   .hit-layer { fill: transparent; cursor: crosshair; }
@@ -152,32 +144,36 @@
   </div>
 
   <div class="toolbar">
-    <label for="query-select">Query</label>
-    <select id="query-select"></select>
-    <span class="scope-badge" id="scope-badge">All queries</span>
+    <span>Showing: <strong id="scope-badge">all queries (run aggregate)</strong></span>
   </div>
 
   <div class="kpi-row" id="kpi-row"></div>
 
+  <div class="chart-card">
+    <h3>Request waterfall</h3>
+    <div class="sub">each query's own timeline -- hover a bar to see its numbers and where it sat in the run below</div>
+    <div id="chart-waterfall"></div>
+  </div>
+
   <div class="chart-grid">
     <div class="chart-card">
       <h3>Concurrency &amp; queue depth</h3>
-      <div class="sub" id="sub-concurrency">requests in the running/waiting scheduler queues</div>
+      <div class="sub">requests in the running/waiting scheduler queues (run aggregate)</div>
       <div id="chart-concurrency"></div>
     </div>
     <div class="chart-card">
       <h3>KV cache usage</h3>
-      <div class="sub" id="sub-kvcache">% of GPU KV cache blocks occupied</div>
+      <div class="sub">% of GPU KV cache blocks occupied (run aggregate)</div>
       <div id="chart-kvcache"></div>
     </div>
     <div class="chart-card">
       <h3>Generation throughput</h3>
-      <div class="sub" id="sub-throughput">tokens/sec, per scrape interval</div>
+      <div class="sub">tokens/sec, per scrape interval (run aggregate)</div>
       <div id="chart-throughput"></div>
     </div>
     <div class="chart-card">
       <h3>Latency</h3>
-      <div class="sub" id="sub-latency">time-to-first-token &amp; inter-token latency, per interval</div>
+      <div class="sub">time-to-first-token &amp; inter-token latency, per interval (run aggregate)</div>
       <div id="chart-latency"></div>
     </div>
   </div>
@@ -271,42 +267,6 @@ function deriveRun(run) {
   return { running, waiting, kvPct, throughput, ttft, itl, duration, kpis };
 }
 
-const SUBTITLES = {
-  concurrency: "requests in the running/waiting scheduler queues",
-  kvcache: "% of GPU KV cache blocks occupied",
-  throughput: "tokens/sec, per scrape interval",
-  latency: "time-to-first-token & inter-token latency, per interval",
-};
-
-// ---- derive this one request's own series: its slice of the engine
-// timeline (running/waiting/KV%), plus real per-token curves built from
-// the token arrival timestamps recorded during its streamed response ----
-function computeQueryWindow(run, req) {
-  const t0 = req.submitted_t, t1 = req.completed_t;
-  let windowSamples = run.samples.filter(s => s.t >= t0 && s.t <= t1);
-  const before = [...run.samples].reverse().find(s => s.t < t0);
-  const after = run.samples.find(s => s.t > t1);
-  if (before) windowSamples = [before, ...windowSamples];
-  if (after) windowSamples = [...windowSamples, after];
-  if (windowSamples.length === 0) windowSamples = run.samples;
-
-  const running = windowSamples.map(s => ({ x: s.t, y: s["vllm:num_requests_running"] ?? 0 }));
-  const waiting = windowSamples.map(s => ({ x: s.t, y: s["vllm:num_requests_waiting"] ?? 0 }));
-  const kvPct = windowSamples.map(s => ({ x: s.t, y: (s["vllm:kv_cache_usage_perc"] ?? 0) * 100 }));
-
-  const tokenTimes = req.token_times || [];
-  const cumulative = [{ x: t0, y: 0 }, ...tokenTimes.map((t, i) => ({ x: t, y: i + 1 }))];
-  const tokenLatency = tokenTimes.map((t, i) => ({
-    x: t,
-    y: (i === 0 ? (t - t0) : (t - tokenTimes[i - 1])) * 1000,
-  }));
-
-  const sampleTs = windowSamples.map(s => s.t);
-  const xDomain = [Math.min(t0, ...sampleTs), Math.max(t1, ...sampleTs, ...tokenTimes)];
-
-  return { running, waiting, kvPct, cumulative, tokenLatency, xDomain };
-}
-
 function stepValueAt(points, x, eps) {
   let val = null;
   for (const p of points) {
@@ -350,6 +310,9 @@ function renderLineChart(mountId, opts) {
   }
 
   const svg = el("svg", { class: "chart", viewBox: `0 0 ${width} ${height}` });
+
+  const highlightRect = el("rect", { class: "highlight-band", x: 0, y: margin.top, width: 0, height: innerH, style: "display:none" });
+  svg.appendChild(highlightRect);
 
   for (let i = 0; i <= 4; i++) {
     const val = (yMax / 4) * i;
@@ -479,6 +442,16 @@ function renderLineChart(mountId, opts) {
   svg.appendChild(hit);
 
   mount.appendChild(svg);
+
+  return {
+    setHighlight(x0, x1) {
+      const px0 = xScale(x0), px1 = xScale(Math.max(x1, x0 + eps));
+      highlightRect.setAttribute("x", px0);
+      highlightRect.setAttribute("width", Math.max(1, px1 - px0));
+      highlightRect.style.display = "block";
+    },
+    clearHighlight() { highlightRect.style.display = "none"; },
+  };
 }
 
 // ---- bar chart (per-bar tooltip, no crosshair) ----
@@ -496,6 +469,9 @@ function renderBarChart(mountId, opts) {
   const yScale = y => margin.top + innerH - (y / yMax) * innerH;
 
   const svg = el("svg", { class: "chart", viewBox: `0 0 ${width} ${height}` });
+
+  const highlightRect = el("rect", { class: "highlight-band", x: 0, y: margin.top, width: 0, height: innerH, style: "display:none" });
+  svg.appendChild(highlightRect);
 
   for (let i = 0; i <= 4; i++) {
     const val = (yMax / 4) * i;
@@ -557,6 +533,16 @@ function renderBarChart(mountId, opts) {
 
   mount.appendChild(svg);
   mount.appendChild(tooltip);
+
+  return {
+    setHighlight(x0, x1) {
+      const px0 = xScale(x0), px1 = xScale(Math.max(x1, x0 + 1e-6));
+      highlightRect.setAttribute("x", px0);
+      highlightRect.setAttribute("width", Math.max(1, px1 - px0));
+      highlightRect.style.display = "block";
+    },
+    clearHighlight() { highlightRect.style.display = "none"; },
+  };
 }
 
 function kpiTile(label, value, unit) {
@@ -653,78 +639,131 @@ function renderRequestsTable(run) {
   table.appendChild(tbody);
 }
 
-function renderAggregateView(run) {
-  const d = deriveRun(run);
-  const blue = cssVar("--series-blue"), orange = cssVar("--series-orange"), aqua = cssVar("--series-aqua");
-  const xDomain = [0, d.duration];
+// ---- request waterfall: one row per query, split into a "waiting for
+// first token" segment and a "generating" segment. This is the view that
+// actually differentiates requests (their offsets/durations/overlap are
+// real distinguishing data); hovering a bar highlights that window on the
+// shared engine charts below and swaps the KPI row to that request's own
+// numbers, per PLAN.md's "click a request, see the metric timeline
+// around it" -- rather than trying to force per-request distinction out
+// of engine metrics that are inherently shared across concurrent requests.
+function renderWaterfall(run, onEnter, onLeave) {
+  const mount = document.getElementById("chart-waterfall");
+  mount.innerHTML = "";
 
-  document.getElementById("sub-concurrency").textContent = SUBTITLES.concurrency;
-  renderLineChart("chart-concurrency", {
-    series: [
-      { key: "running", label: "running", color: blue, points: d.running },
-      { key: "waiting", label: "waiting", color: orange, points: d.waiting },
-    ],
-    xDomain, yFmt: v => v.toFixed(0),
+  const rows = [...run.requests].sort((a, b) => a.submitted_t - b.submitted_t);
+  const rowH = 28, barH = 14;
+  const margin = { top: 10, right: 14, bottom: 22, left: 230 };
+  const width = 960;
+  const innerW = width - margin.left - margin.right;
+  const innerH = rows.length * rowH;
+  const height = margin.top + innerH + margin.bottom;
+
+  const xDomain = [0, run.run.duration_s || 1];
+  const xScale = x => margin.left + (x / xDomain[1]) * innerW;
+
+  const waitColor = cssVar("--series-orange"), genColor = cssVar("--series-blue");
+
+  const legend = document.createElement("div");
+  legend.className = "legend";
+  [["waiting for first token", waitColor], ["generating", genColor]].forEach(([label, color]) => {
+    const item = document.createElement("div");
+    item.className = "legend-item";
+    const key = document.createElement("span");
+    key.className = "legend-key";
+    key.style.background = color;
+    item.appendChild(key);
+    const text = document.createElement("span");
+    text.textContent = label;
+    item.appendChild(text);
+    legend.appendChild(item);
+  });
+  mount.appendChild(legend);
+
+  const svg = el("svg", { class: "chart", viewBox: `0 0 ${width} ${height}` });
+
+  [0, 0.25, 0.5, 0.75, 1].forEach((frac, i) => {
+    const xv = xDomain[1] * frac;
+    const x = xScale(xv);
+    svg.appendChild(el("line", { class: "grid-line", x1: x, x2: x, y1: margin.top, y2: margin.top + innerH }));
+    const anchor = i === 0 ? "start" : (i === 4 ? "end" : "middle");
+    const label = el("text", { class: "axis-label", x, y: height - 6, "text-anchor": anchor });
+    label.textContent = fmtSeconds(xv);
+    svg.appendChild(label);
   });
 
-  document.getElementById("sub-kvcache").textContent = SUBTITLES.kvcache;
-  renderLineChart("chart-kvcache", {
-    series: [{ key: "kv", label: "KV cache %", color: aqua, area: true, points: d.kvPct }],
-    xDomain, yFmt: v => v.toFixed(2) + "%",
+  const tooltip = document.createElement("div");
+  tooltip.className = "tooltip";
+  mount.style.position = "relative";
+
+  function activate(req, cx) {
+    onEnter(req);
+    tooltip.innerHTML = "";
+    const timeEl = document.createElement("div");
+    timeEl.className = "t-time";
+    timeEl.textContent = `[${req.kind}] ${req.label}`;
+    tooltip.appendChild(timeEl);
+    [
+      ["TTFT", fmtMs(req.ttft_ms)],
+      ["Inter-token latency", req.itl_ms !== null ? req.itl_ms.toFixed(1) + "ms" : "—"],
+      ["End-to-end", fmtMs(req.e2e_ms)],
+      ["Tokens", `${req.prompt_tokens ?? "—"} in / ${req.completion_tokens ?? "—"} out`],
+    ].forEach(([label, value]) => {
+      const row = document.createElement("div");
+      row.className = "t-row";
+      const lbl = document.createElement("span");
+      lbl.className = "t-key";
+      lbl.textContent = label;
+      row.appendChild(lbl);
+      const val = document.createElement("span");
+      val.className = "t-val";
+      val.textContent = value;
+      row.appendChild(val);
+      tooltip.appendChild(row);
+    });
+    tooltip.classList.add("visible");
+    const bbox = mount.getBoundingClientRect();
+    let left = (cx / width) * bbox.width + 10;
+    if (left + 220 > bbox.width) left = (cx / width) * bbox.width - 230;
+    tooltip.style.left = left + "px";
+    tooltip.style.top = "4px";
+  }
+  function deactivate() {
+    onLeave();
+    tooltip.classList.remove("visible");
+  }
+
+  rows.forEach((req, i) => {
+    const y = margin.top + i * rowH + rowH / 2;
+
+    const label = el("text", { class: "axis-label", x: 0, y: y + 4, "text-anchor": "start" });
+    label.textContent = `[${req.kind}] ${req.label}`.slice(0, 32);
+    svg.appendChild(label);
+
+    const t0 = req.submitted_t;
+    const t1 = req.first_token_t ?? req.completed_t;
+    const t2 = req.completed_t;
+    const midX = (xScale(t0) + xScale(t2)) / 2;
+
+    const waitRect = el("rect", {
+      x: xScale(t0), y: y - barH / 2, width: Math.max(1, xScale(t1) - xScale(t0)), height: barH,
+      fill: waitColor, rx: 3, tabindex: 0,
+    });
+    const genRect = el("rect", {
+      x: xScale(t1), y: y - barH / 2, width: Math.max(1, xScale(t2) - xScale(t1)), height: barH,
+      fill: genColor, rx: 3, tabindex: 0,
+    });
+    [waitRect, genRect].forEach(rect => {
+      rect.addEventListener("pointerenter", () => activate(req, midX));
+      rect.addEventListener("focus", () => activate(req, midX));
+      rect.addEventListener("pointerleave", deactivate);
+      rect.addEventListener("blur", deactivate);
+      svg.appendChild(rect);
+    });
   });
 
-  document.getElementById("sub-throughput").textContent = SUBTITLES.throughput;
-  renderBarChart("chart-throughput", {
-    points: d.throughput, color: blue, xDomain, yFmt: v => v.toFixed(0) + " tok/s",
-  });
-
-  document.getElementById("sub-latency").textContent = SUBTITLES.latency;
-  renderLineChart("chart-latency", {
-    series: [
-      { key: "ttft", label: "TTFT", color: blue, points: d.ttft },
-      { key: "itl", label: "ITL", color: orange, points: d.itl },
-    ],
-    xDomain, yFmt: v => v.toFixed(0) + "ms",
-  });
-
-  renderAggregateKpis(d);
-  document.getElementById("scope-badge").textContent = "All queries";
-}
-
-function renderQueryView(run, req) {
-  const win = computeQueryWindow(run, req);
-  const blue = cssVar("--series-blue"), orange = cssVar("--series-orange"), aqua = cssVar("--series-aqua");
-
-  document.getElementById("sub-concurrency").textContent = "running/waiting, during this query's own window";
-  renderLineChart("chart-concurrency", {
-    series: [
-      { key: "running", label: "running", color: blue, points: win.running },
-      { key: "waiting", label: "waiting", color: orange, points: win.waiting },
-    ],
-    xDomain: win.xDomain, yFmt: v => v.toFixed(0),
-  });
-
-  document.getElementById("sub-kvcache").textContent = "KV cache %, during this query's own window";
-  renderLineChart("chart-kvcache", {
-    series: [{ key: "kv", label: "KV cache %", color: aqua, area: true, points: win.kvPct }],
-    xDomain: win.xDomain, yFmt: v => v.toFixed(2) + "%",
-  });
-
-  document.getElementById("sub-throughput").textContent = "cumulative tokens generated by this query";
-  renderLineChart("chart-throughput", {
-    series: [{ key: "tokens", label: "tokens generated", color: blue, points: win.cumulative }],
-    xDomain: win.xDomain, yFmt: v => v.toFixed(0),
-  });
-
-  document.getElementById("sub-latency").textContent = "gap before each token this query received (first point = TTFT)";
-  renderLineChart("chart-latency", {
-    series: [{ key: "gap", label: "token gap", color: orange, points: win.tokenLatency }],
-    xDomain: win.xDomain, yFmt: v => v.toFixed(0) + "ms",
-  });
-
-  renderQueryKpis(req);
-  const badge = document.getElementById("scope-badge");
-  badge.textContent = `${req.submitted_t.toFixed(1)}s → ${req.completed_t.toFixed(1)}s of ${run.run.duration_s.toFixed(1)}s run`;
+  mount.appendChild(svg);
+  mount.appendChild(tooltip);
 }
 
 function init() {
@@ -733,30 +772,52 @@ function init() {
   document.getElementById("sample-count").textContent = RUN.samples.length;
   document.getElementById("run-duration").textContent = fmtSeconds(RUN.run.duration_s) + " run";
 
-  renderAggregateView(RUN);
+  const d = deriveRun(RUN);
+  const blue = cssVar("--series-blue"), orange = cssVar("--series-orange"), aqua = cssVar("--series-aqua");
+  const xDomain = [0, d.duration];
+
+  const charts = {
+    concurrency: renderLineChart("chart-concurrency", {
+      series: [
+        { key: "running", label: "running", color: blue, points: d.running },
+        { key: "waiting", label: "waiting", color: orange, points: d.waiting },
+      ],
+      xDomain, yFmt: v => v.toFixed(0),
+    }),
+    kvcache: renderLineChart("chart-kvcache", {
+      series: [{ key: "kv", label: "KV cache %", color: aqua, area: true, points: d.kvPct }],
+      xDomain, yFmt: v => v.toFixed(2) + "%",
+    }),
+    throughput: renderBarChart("chart-throughput", {
+      points: d.throughput, color: blue, xDomain, yFmt: v => v.toFixed(0) + " tok/s",
+    }),
+    latency: renderLineChart("chart-latency", {
+      series: [
+        { key: "ttft", label: "TTFT", color: blue, points: d.ttft },
+        { key: "itl", label: "ITL", color: orange, points: d.itl },
+      ],
+      xDomain, yFmt: v => v.toFixed(0) + "ms",
+    }),
+  };
+
+  renderAggregateKpis(d);
   renderSamplesTable(RUN);
   renderRequestsTable(RUN);
 
-  const select = document.getElementById("query-select");
-  const allOpt = document.createElement("option");
-  allOpt.value = "__all__";
-  allOpt.textContent = "All queries (run aggregate)";
-  select.appendChild(allOpt);
-  RUN.requests.forEach(r => {
-    const opt = document.createElement("option");
-    opt.value = r.request_id;
-    opt.textContent = `[${r.kind}] ${r.label}`;
-    select.appendChild(opt);
-  });
-
-  select.addEventListener("change", () => {
-    if (select.value === "__all__") {
-      renderAggregateView(RUN);
-    } else {
-      const req = RUN.requests.find(r => r.request_id === select.value);
-      renderQueryView(RUN, req);
-    }
-  });
+  renderWaterfall(
+    RUN,
+    (req) => {
+      renderQueryKpis(req);
+      Object.values(charts).forEach(c => c.setHighlight(req.submitted_t, req.completed_t));
+      document.getElementById("scope-badge").textContent =
+        `${req.kind}: "${req.label}" (${req.submitted_t.toFixed(1)}s → ${req.completed_t.toFixed(1)}s of run)`;
+    },
+    () => {
+      renderAggregateKpis(d);
+      Object.values(charts).forEach(c => c.clearHighlight());
+      document.getElementById("scope-badge").textContent = "all queries (run aggregate)";
+    },
+  );
 }
 init();
 </script>
