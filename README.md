@@ -131,3 +131,13 @@ settled, not locked in now.
    §3, rather than generic threshold alerts.
 5. **Phase 4 — Fleet view.** Multi-replica/multi-model view, cost/token
    overlay.
+
+## Files
+
+Under `poc-vllm-metal/` (run from that directory):
+
+- `run.sh` — activates the vllm-metal venv and runs `basic_test.py`.
+- `run_metrics.sh` — activates the venv, records a run with `metrics_test.py`,
+  and builds `dashboard.html`. Flags: `[--stress] [--max-num-seqs N]`.
+- `run_dashboard.sh` — activates the venv and re-renders `dashboard.html` from
+  recorded data via `build_dashboard.py`, without recording. Flag: `[--run-id ID]`.
