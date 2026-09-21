@@ -1,7 +1,7 @@
 """
-Phase 0/2: run vLLM as an OpenAI-compatible server, fire every prompt from
+Phase 0: run vLLM as an OpenAI-compatible server, fire every prompt from
 basic_test.py at it *concurrently* as its own streamed request, and record
-what happened from three sources: the engine-wide Prometheus /metrics
+what happened from three sources: vllm Prometheus /metrics
 timeline, real per-request timing measured client-side over the SSE stream
 (TTFT/ITL/E2E, not approximated from engine aggregates), and the real
 server-side OpenTelemetry span vLLM exports per request (queue/prefill/
@@ -12,18 +12,16 @@ Also renders the run straight to dashboard.html afterwards (see
 build_dashboard.py) so one command gets you from a cold server to a
 viewable page.
 
-By default this fires basic_test.py's 8-prompt smoke test, which never
-queues or contends for anything -- pass --stress to fire stress_workload.py's
-scheduler-overloading mix instead (many concurrent short requests plus
-long-context "hog" requests, with a low --max-num-seqs cap), which is what
-actually produces queueing/KV-pressure signal for the dashboard to show.
+This is the smoke-test run, which never queues or contends for anything.
+For the scheduler-overloading workload, see stress_test.py, which reuses
+record_run() from here.
 
 Run inside the vllm-metal venv:
     source ~/.venv-vllm-metal/bin/activate
-    python metrics_test.py [--stress] [--max-num-seqs N]
+    python metrics_test.py [--max-num-seqs N]
 
 Or via the helper script from this directory:
-    ./run_metrics.sh [--stress] [--max-num-seqs N]
+    ./run_metrics.sh [--max-num-seqs N]
 """
 
 import argparse
@@ -43,21 +41,20 @@ import metrics_db
 from basic_test import CONVERSATIONS, MODEL, RAW_PROMPTS
 from build_dashboard import render_dashboard
 from otel_receiver import OtelSpanReceiver
-from stress_workload import build_stress_jobs
 
 HOST = "127.0.0.1"
 PORT = 8000
 BASE_URL = f"http://{HOST}:{PORT}"
 OTEL_HOST = "127.0.0.1"
 OTEL_PORT = 4318
-STARTUP_TIMEOUT_S = 300
-POLL_INTERVAL_S = 0.2
-OTEL_FLUSH_GRACE_S = 2.0
+STARTUP_TIMEOUT_SEC = 300 # how long to wait for server
+POLL_INTERVAL_SEC = 0.2  # how often /metrics is scraped
+OTEL_FLUSH_GRACE_SEC = 2.0  # pause at the end
 
 # Golden-signal metrics (see PLAN.md phase 0): queue depth, KV cache %,
 # token throughput, the latency histograms behind TTFT/ITL/e2e, and
 # preemption count (only non-zero once KV cache is actually exhausted --
-# see --num-gpu-blocks-override / --stress-preempt).
+# see stress_test.py --num-gpu-blocks-override).
 WANTED_METRICS = {
     "vllm:num_requests_running",
     "vllm:num_requests_waiting",
@@ -101,8 +98,8 @@ def parse_metrics(text: str) -> dict[str, float]:
 class MetricsPoller:
     """Scrapes /metrics on a background thread until stopped."""
 
-    def __init__(self, interval_s: float) -> None:
-        self._interval_s = interval_s
+    def __init__(self, interval_sec: float) -> None:
+        self._interval_sec = interval_sec
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self.samples: list[tuple[float, dict]] = []
@@ -118,7 +115,7 @@ class MetricsPoller:
                 self.samples.append((t, values))
             except requests.exceptions.RequestException:
                 pass
-            self._stop.wait(self._interval_s)
+            self._stop.wait(self._interval_sec)
 
     def start(self, start_time: float) -> None:
         self._start_time = start_time
@@ -134,7 +131,8 @@ class MetricsPoller:
 
 
 def wait_for_server(proc: subprocess.Popen) -> None:
-    deadline = time.monotonic() + STARTUP_TIMEOUT_S
+    """Checks server /health."""
+    deadline = time.monotonic() + STARTUP_TIMEOUT_SEC
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise RuntimeError(f"vllm serve exited early with code {proc.returncode}")
@@ -144,19 +142,18 @@ def wait_for_server(proc: subprocess.Popen) -> None:
         except requests.exceptions.ConnectionError:
             pass
         time.sleep(2)
-    raise TimeoutError(f"vllm serve did not become healthy within {STARTUP_TIMEOUT_S}s")
+    raise TimeoutError(f"vllm serve did not become healthy within {STARTUP_TIMEOUT_SEC}s")
 
 
 def truncate(text: str, n: int = 60) -> str:
+    """Truncates text."""
     text = " ".join(text.split())
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
 def stream_request(path: str, payload: dict, start_time: float) -> dict:
     """POST a streamed OpenAI-compatible request, recording the arrival
-    time of *every* token (not just the first), since that's what lets the
-    dashboard draw this specific request's own latency/throughput curve
-    instead of a single averaged number."""
+    time of every token."""
     submitted_t = time.monotonic() - start_time
     token_times: list[float] = []
     prompt_tokens = completion_tokens = None
@@ -236,22 +233,8 @@ def chat_job(messages: list[dict]) -> tuple[str, str, str, dict]:
     return "chat", label, "/v1/chat/completions", payload
 
 
-def stress_job(job: dict) -> tuple[str, str, str, dict]:
-    payload = {
-        "model": MODEL,
-        "prompt": job["prompt"],
-        "temperature": 0.7,
-        "max_tokens": job["max_tokens"],
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    }
-    return job["kind"], job["label"], "/v1/completions", payload
-
-
 def run_all_queries(start_time: float, jobs: list[tuple[str, str, str, dict]]) -> list[dict]:
-    """Fires every job as its own concurrent streamed request, so the
-    server actually sees the multi-session load PLAN.md is about, and each
-    query gets its own real (not engine-averaged) timing."""
+    """Fires every job as its own concurrent streamed request."""
     results = []
     with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
         futures = {
@@ -270,41 +253,17 @@ def run_all_queries(start_time: float, jobs: list[tuple[str, str, str, dict]]) -
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--stress", action="store_true",
-        help="Fire stress_workload.py's scheduler-overloading mix instead of basic_test.py's smoke-test prompts.",
-    )
-    parser.add_argument(
         "--max-num-seqs", type=int, default=None,
         help="Cap vLLM's scheduler batch size (passed through to `vllm serve`). "
-        "Defaults to 4 with --stress (to force real queueing), otherwise left at vLLM's own default.",
-    )
-    parser.add_argument(
-        "--num-gpu-blocks-override", type=int, default=None,
-        help="Shrink vLLM's KV cache pool to this many blocks (passed through to `vllm serve`, which documents "
-        "this flag as 'used for testing preemption'). Use a value well below the profiled default (~4700 blocks "
-        "here) to force real vllm:num_preemptions_total once concurrent requests' KV demand exceeds it. vLLM "
-        "refuses to start unless --max-model-len also fits within this budget -- pair the two.",
-    )
-    parser.add_argument(
-        "--max-model-len", type=int, default=None,
-        help="Passed through to `vllm serve`. Required alongside --num-gpu-blocks-override, since vLLM won't "
-        "start if the shrunk KV cache can't hold even one request at the model's default max context length.",
-    )
-    parser.add_argument("--num-hogs", type=int, default=2, help="Long-context requests to fire with --stress.")
-    parser.add_argument("--short-multiplier", type=int, default=4, help="Copies of each short prompt with --stress.")
-    parser.add_argument("--hog-words", type=int, default=3000, help="Approx. word count per hog prompt.")
-    parser.add_argument(
-        "--short-max-tokens", type=int, default=64,
-        help="max_tokens for the short --stress prompts. Set high (e.g. 800) with --num-hogs 0 to target "
-        "mid-decode preemption instead of admission-time queueing (see stress_workload.build_stress_jobs).",
+        "Left at vLLM's own default if unset.",
     )
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    max_num_seqs = args.max_num_seqs if args.max_num_seqs is not None else (4 if args.stress else None)
-
+def record_run(jobs: list[tuple[str, str, str, dict]], serve_args: list[str] | None = None) -> None:
+    """Starts vllm serve (with any extra `serve_args`), fires `jobs`
+    concurrently while recording, writes the run to the DB, and renders
+    dashboard.html."""
     otel_receiver = OtelSpanReceiver(OTEL_HOST, OTEL_PORT)
     otel_receiver.start()
 
@@ -313,14 +272,9 @@ def main() -> None:
         "vllm", "serve", MODEL, "--host", HOST, "--port", str(PORT),
         "--otlp-traces-endpoint", otel_receiver.endpoint,
     ]
-    if max_num_seqs is not None:
-        serve_cmd += ["--max-num-seqs", str(max_num_seqs)]
-    if args.num_gpu_blocks_override is not None:
-        serve_cmd += ["--num-gpu-blocks-override", str(args.num_gpu_blocks_override)]
-    if args.max_model_len is not None:
-        serve_cmd += ["--max-model-len", str(args.max_model_len)]
+    serve_cmd += serve_args or []
     proc = subprocess.Popen(serve_cmd, env=vllm_env)
-    poller = MetricsPoller(POLL_INTERVAL_S)
+    poller = MetricsPoller(POLL_INTERVAL_SEC)
     start_time = time.monotonic()
     try:
         print(f"Waiting for vllm serve to come up on {BASE_URL} ...")
@@ -328,25 +282,11 @@ def main() -> None:
         print("Server is healthy. Starting metrics poller and firing all queries concurrently.")
         poller.start(start_time)
 
-        if args.stress:
-            jobs = [
-                stress_job(j)
-                for j in build_stress_jobs(
-                    short_multiplier=args.short_multiplier, num_hogs=args.num_hogs, hog_words=args.hog_words,
-                    short_max_tokens=args.short_max_tokens,
-                )
-            ]
-            print(
-                f"Stress mode: firing {len(jobs)} concurrent requests "
-                f"(max-num-seqs={max_num_seqs}, num-gpu-blocks-override={args.num_gpu_blocks_override})."
-            )
-        else:
-            jobs = [completion_job(p) for p in RAW_PROMPTS] + [chat_job(c) for c in CONVERSATIONS]
         results = run_all_queries(start_time, jobs)
 
         # A few extra samples so the tail of the run (post-request settling)
         # shows up in the chart too.
-        time.sleep(POLL_INTERVAL_S * 4)
+        time.sleep(POLL_INTERVAL_SEC * 4)
     finally:
         poller.stop()
         proc.terminate()
@@ -359,7 +299,7 @@ def main() -> None:
         # vLLM's BatchSpanProcessor flushes remaining spans on process exit
         # (atexit), which races the shutdown above -- give it a moment to
         # land on the receiver before we stop listening.
-        time.sleep(OTEL_FLUSH_GRACE_S)
+        time.sleep(OTEL_FLUSH_GRACE_SEC)
         otel_receiver.stop()
 
     duration_s = max((t for t, _ in poller.samples), default=0.0)
@@ -385,6 +325,13 @@ def main() -> None:
     dashboard_path = Path(__file__).parent / "dashboard.html"
     render_dashboard(run_id, metrics_db.DB_PATH, dashboard_path)
     print(f"Wrote dashboard to {dashboard_path}")
+
+
+def main() -> None:
+    args = parse_args()
+    jobs = [completion_job(p) for p in RAW_PROMPTS] + [chat_job(c) for c in CONVERSATIONS]
+    serve_args = ["--max-num-seqs", str(args.max_num_seqs)] if args.max_num_seqs is not None else []
+    record_run(jobs, serve_args)
 
 
 if __name__ == "__main__":

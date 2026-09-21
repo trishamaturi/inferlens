@@ -1,14 +1,13 @@
 """
-Phase 0 smoke test: prove we can talk to vLLM, via offline batched
+Phase 0 test: talk to vLLM, via offline batched
 inference (no server, no OTLP/metrics endpoint yet).
 
 Demonstrates the two distinct modes:
-  - .generate(): a batch of independent raw-text prompts, no chat
-    template -- the model just continues the string. Classic vLLM
+  - .generate(): a batch of independent raw-text prompts, the model 
+    just continues the string. vLLM
     quickstart style ("Hello, my name is" -> model completes it).
   - .chat(): a "conversation" (list of role-tagged turns) run through
-    the model's chat template -- what an instruct-tuned model actually
-    expects for question-answering.
+    the model's chat template -- used for question-answering.
 
 Run inside the vllm-metal venv:
     source ~/.venv-vllm-metal/bin/activate
@@ -53,8 +52,7 @@ def main() -> None:
         print(f"Completion: {output.outputs[0].text!r}")
 
     print("\n### Conversation (.chat(), chat template applied) ###")
-    # .chat() applies the model's chat template instead of treating the
-    # prompt as raw text completion -- matters for instruct-tuned models.
+
     chat_outputs = llm.chat(
         CONVERSATIONS, sampling_params, chat_template_kwargs={"enable_thinking": False}
     )

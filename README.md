@@ -136,8 +136,25 @@ settled, not locked in now.
 
 Under `poc-vllm-metal/` (run from that directory):
 
+- `basic_test.py` — offline smoke test: loads the model in-process (no server)
+  and runs a few raw-text prompts (`.generate()`) and chat conversations
+  (`.chat()`). Also defines `MODEL`, `RAW_PROMPTS` and `CONVERSATIONS`, which
+  the other scripts reuse.
+- `metrics_test.py` — starts `vllm serve`, fires the `basic_test.py` prompts
+  concurrently as streamed requests, and records engine `/metrics` samples,
+  per-request TTFT/ITL/e2e and per-token times, and vLLM's OTel spans into
+  `vllm_metrics.db`, then renders `dashboard.html`. `record_run()` is the shared
+  recorder.
+- `stress_test.py` — same recording via `record_run()`, but with a
+  scheduler-overloading workload (many short requests plus long-context
+  "hogs" under a low `--max-num-seqs`) to produce real queueing/KV-pressure
+  signal.
 - `run.sh` — activates the vllm-metal venv and runs `basic_test.py`.
 - `run_metrics.sh` — activates the venv, records a run with `metrics_test.py`,
-  and builds `dashboard.html`. Flags: `[--stress] [--max-num-seqs N]`.
+  and builds `dashboard.html`. Flag: `[--max-num-seqs N]`.
+- `run_stress.sh` — same as `run_metrics.sh` but runs `stress_test.py`, a
+  scheduler-overloading mix (many short requests plus long-context "hogs" under
+  a low `--max-num-seqs`) that produces real queueing/KV-pressure signal.
+  Flags: see `stress_test.py --help`.
 - `run_dashboard.sh` — activates the venv and re-renders `dashboard.html` from
   recorded data via `build_dashboard.py`, without recording. Flag: `[--run-id ID]`.
