@@ -7,7 +7,7 @@ question is "was this short request queued behind a half-million-token
 context request hogging the batch?"; you can't observe that from 8 prompts
 totaling a few hundred tokens.
 
-Used by metrics_test.py's --stress flag.
+Used by stress_test.py.
 """
 
 SHORT_PROMPTS = [
