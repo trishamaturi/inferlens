@@ -12,6 +12,7 @@
     --series-blue: #2a78d6;
     --series-orange:#eb6834;
     --series-aqua: #1baf7a;
+    --status-critical: #d03b3b;
     --shadow:      0 1px 2px rgba(11,11,11,0.04), 0 8px 24px rgba(11,11,11,0.05);
   }
   @media (prefers-color-scheme: dark) {
@@ -105,6 +106,7 @@
   .series-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
   .series-area { stroke: none; opacity: 0.12; }
   .end-dot { stroke-width: 2; }
+  .stall-marker { fill: var(--status-critical); }
   .end-label { font-size: 11px; font-weight: 600; font-family: system-ui, sans-serif; }
   .highlight-band { fill: var(--series-blue); opacity: 0.10; }
   .crosshair-line { stroke: var(--baseline); stroke-width: 1; pointer-events: none; }
@@ -156,7 +158,7 @@
 
   <div class="chart-card">
     <h3>Request waterfall</h3>
-    <div class="sub">each query's own timeline -- hover a bar to see its numbers and where it sat in the run below</div>
+    <div class="sub">each query's own timeline -- hover a bar to see its numbers; red ticks mark likely preemption stalls</div>
     <div id="chart-waterfall"></div>
   </div>
 
@@ -228,6 +230,25 @@ function fmtCompact(n) {
 function fmtSeconds(n) { return n.toFixed(1) + "s"; }
 function fmtMs(n) { return n === null || n === undefined ? "—" : n.toFixed(0) + "ms"; }
 
+// ---- stall detection: vLLM tracks a per-request preemption count
+// internally (request.num_preemptions) but never exposes it -- not in the
+// OTel span, not in /metrics, not in the API response. What we *do* have
+// is every token's real arrival time, and a preemption forces the engine
+// to re-admit and redo prefill before resuming, which shows up as one
+// inter-token gap orders of magnitude past the rest. This is an estimate
+// (any sufficiently long stall reads as one), not vLLM's ground truth.
+const STALL_THRESHOLD_MS = 800;
+
+function detectStalls(req) {
+  const times = req.token_times || [];
+  const stalls = [];
+  for (let i = 1; i < times.length; i++) {
+    const gapMs = (times[i] - times[i - 1]) * 1000;
+    if (gapMs > STALL_THRESHOLD_MS) stalls.push({ t: times[i - 1], gapMs });
+  }
+  return stalls;
+}
+
 // ---- derive engine-aggregate series from raw cumulative samples ----
 function deriveRun(run) {
   const s = run.samples;
@@ -267,6 +288,7 @@ function deriveRun(run) {
     avgItlMs: (last["vllm:inter_token_latency_seconds_count"] ?? 0) > 0
       ? (last["vllm:inter_token_latency_seconds_sum"] / last["vllm:inter_token_latency_seconds_count"]) * 1000 : 0,
     peakKvPct: Math.max(0, ...s.map(x => (x["vllm:kv_cache_usage_perc"] ?? 0) * 100)),
+    preemptions: last["vllm:num_preemptions_total"] ?? 0,
   };
 
   return { running, waiting, kvPct, throughput, ttft, itl, duration, kpis };
@@ -571,6 +593,7 @@ function renderAggregateKpis(d) {
   row.appendChild(kpiTile("Avg TTFT", d.kpis.avgTtftMs.toFixed(0), "ms"));
   row.appendChild(kpiTile("Avg ITL", d.kpis.avgItlMs.toFixed(1), "ms"));
   row.appendChild(kpiTile("Peak KV cache", d.kpis.peakKvPct.toFixed(2), "%"));
+  row.appendChild(kpiTile("Preemptions", d.kpis.preemptions.toFixed(0)));
 }
 
 function renderQueryKpis(req) {
@@ -635,6 +658,12 @@ function renderRequestsTable(run) {
     ["e2e", r => fmtMs(r.e2e_ms)],
     ["prompt tok", r => r.prompt_tokens ?? "—"],
     ["completion tok", r => r.completion_tokens ?? "—"],
+    ["stalls (est.)", r => {
+      const stalls = detectStalls(r);
+      if (stalls.length === 0) return "—";
+      const totalS = stalls.reduce((sum, s) => sum + s.gapMs, 0) / 1000;
+      return `${stalls.length} (${totalS.toFixed(1)}s)`;
+    }],
   ];
   const thead = document.createElement("thead");
   const htr = document.createElement("tr");
@@ -680,11 +709,15 @@ function renderWaterfall(run, onEnter, onLeave) {
   const xScale = x => margin.left + (x / xDomain[1]) * innerW;
 
   const queueColor = cssVar("--series-orange"), prefillColor = cssVar("--series-aqua"), decodeColor = cssVar("--series-blue");
+  const stallColor = cssVar("--status-critical");
   const hasOtel = rows.some(r => r.otel);
+  const stallsByRequest = new Map(rows.map(r => [r.request_id, detectStalls(r)]));
+  const hasStalls = [...stallsByRequest.values()].some(s => s.length > 0);
 
   const legendEntries = hasOtel
     ? [["queued (server)", queueColor], ["prefill (server)", prefillColor], ["decode (server)", decodeColor]]
     : [["waiting for first token (client)", queueColor], ["generating (client)", decodeColor]];
+  if (hasStalls) legendEntries.push([`stall (est., >${STALL_THRESHOLD_MS}ms gap)`, stallColor]);
   const legend = document.createElement("div");
   legend.className = "legend";
   legendEntries.forEach(([label, color]) => {
@@ -736,6 +769,11 @@ function renderWaterfall(run, onEnter, onLeave) {
       ["End-to-end", fmtMs(req.e2e_ms)],
       ["Tokens", `${req.prompt_tokens ?? "—"} in / ${req.completion_tokens ?? "—"} out`],
     );
+    const stalls = stallsByRequest.get(req.request_id) || [];
+    if (stalls.length > 0) {
+      const totalS = stalls.reduce((sum, s) => sum + s.gapMs, 0) / 1000;
+      rowsData.push([`Stalls (est., >${STALL_THRESHOLD_MS}ms gap)`, `${stalls.length} (${totalS.toFixed(1)}s total)`]);
+    }
     rowsData.forEach(([label, value]) => {
       const row = document.createElement("div");
       row.className = "t-row";
@@ -802,6 +840,18 @@ function renderWaterfall(run, onEnter, onLeave) {
       rect.addEventListener("pointerleave", deactivate);
       rect.addEventListener("blur", deactivate);
       svg.appendChild(rect);
+    });
+
+    // token_times share the same clock as submitted_t/completed_t (both
+    // relative to the run's start_time), so stall positions plot directly
+    // on this row without any anchoring math.
+    (stallsByRequest.get(req.request_id) || []).forEach(stall => {
+      const marker = el("rect", {
+        class: "stall-marker", x: xScale(stall.t) - 1, y: y - barH / 2 - 2, width: 2, height: barH + 4,
+      });
+      marker.addEventListener("pointerenter", () => activate(req, midX));
+      marker.addEventListener("pointerleave", deactivate);
+      svg.appendChild(marker);
     });
   });
 

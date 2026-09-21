@@ -55,7 +55,9 @@ POLL_INTERVAL_S = 0.2
 OTEL_FLUSH_GRACE_S = 2.0
 
 # Golden-signal metrics (see PLAN.md phase 0): queue depth, KV cache %,
-# token throughput, and the latency histograms behind TTFT/ITL/e2e.
+# token throughput, the latency histograms behind TTFT/ITL/e2e, and
+# preemption count (only non-zero once KV cache is actually exhausted --
+# see --num-gpu-blocks-override / --stress-preempt).
 WANTED_METRICS = {
     "vllm:num_requests_running",
     "vllm:num_requests_waiting",
@@ -68,6 +70,9 @@ WANTED_METRICS = {
     "vllm:inter_token_latency_seconds_count",
     "vllm:e2e_request_latency_seconds_sum",
     "vllm:e2e_request_latency_seconds_count",
+    "vllm:num_preemptions_total",
+    "vllm:prefix_cache_queries_total",
+    "vllm:prefix_cache_hits_total",
 }
 
 
@@ -121,7 +126,11 @@ class MetricsPoller:
 
     def stop(self) -> None:
         self._stop.set()
-        self._thread.join(timeout=5)
+        # stop() is called from `finally`, including when the server never
+        # became healthy and start() was never reached -- joining an
+        # unstarted Thread raises, which would mask the real startup error.
+        if self._thread.ident is not None:
+            self._thread.join(timeout=5)
 
 
 def wait_for_server(proc: subprocess.Popen) -> None:
@@ -269,6 +278,26 @@ def parse_args() -> argparse.Namespace:
         help="Cap vLLM's scheduler batch size (passed through to `vllm serve`). "
         "Defaults to 4 with --stress (to force real queueing), otherwise left at vLLM's own default.",
     )
+    parser.add_argument(
+        "--num-gpu-blocks-override", type=int, default=None,
+        help="Shrink vLLM's KV cache pool to this many blocks (passed through to `vllm serve`, which documents "
+        "this flag as 'used for testing preemption'). Use a value well below the profiled default (~4700 blocks "
+        "here) to force real vllm:num_preemptions_total once concurrent requests' KV demand exceeds it. vLLM "
+        "refuses to start unless --max-model-len also fits within this budget -- pair the two.",
+    )
+    parser.add_argument(
+        "--max-model-len", type=int, default=None,
+        help="Passed through to `vllm serve`. Required alongside --num-gpu-blocks-override, since vLLM won't "
+        "start if the shrunk KV cache can't hold even one request at the model's default max context length.",
+    )
+    parser.add_argument("--num-hogs", type=int, default=2, help="Long-context requests to fire with --stress.")
+    parser.add_argument("--short-multiplier", type=int, default=4, help="Copies of each short prompt with --stress.")
+    parser.add_argument("--hog-words", type=int, default=3000, help="Approx. word count per hog prompt.")
+    parser.add_argument(
+        "--short-max-tokens", type=int, default=64,
+        help="max_tokens for the short --stress prompts. Set high (e.g. 800) with --num-hogs 0 to target "
+        "mid-decode preemption instead of admission-time queueing (see stress_workload.build_stress_jobs).",
+    )
     return parser.parse_args()
 
 
@@ -286,6 +315,10 @@ def main() -> None:
     ]
     if max_num_seqs is not None:
         serve_cmd += ["--max-num-seqs", str(max_num_seqs)]
+    if args.num_gpu_blocks_override is not None:
+        serve_cmd += ["--num-gpu-blocks-override", str(args.num_gpu_blocks_override)]
+    if args.max_model_len is not None:
+        serve_cmd += ["--max-model-len", str(args.max_model_len)]
     proc = subprocess.Popen(serve_cmd, env=vllm_env)
     poller = MetricsPoller(POLL_INTERVAL_S)
     start_time = time.monotonic()
@@ -296,8 +329,17 @@ def main() -> None:
         poller.start(start_time)
 
         if args.stress:
-            jobs = [stress_job(j) for j in build_stress_jobs()]
-            print(f"Stress mode: firing {len(jobs)} concurrent requests against max-num-seqs={max_num_seqs}.")
+            jobs = [
+                stress_job(j)
+                for j in build_stress_jobs(
+                    short_multiplier=args.short_multiplier, num_hogs=args.num_hogs, hog_words=args.hog_words,
+                    short_max_tokens=args.short_max_tokens,
+                )
+            ]
+            print(
+                f"Stress mode: firing {len(jobs)} concurrent requests "
+                f"(max-num-seqs={max_num_seqs}, num-gpu-blocks-override={args.num_gpu_blocks_override})."
+            )
         else:
             jobs = [completion_job(p) for p in RAW_PROMPTS] + [chat_job(c) for c in CONVERSATIONS]
         results = run_all_queries(start_time, jobs)
