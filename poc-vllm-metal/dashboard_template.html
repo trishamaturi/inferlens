@@ -254,6 +254,7 @@ function deriveRun(run) {
   const s = run.samples;
   const running = s.map(x => ({ x: x.t, y: x["vllm:num_requests_running"] ?? 0 }));
   const waiting = s.map(x => ({ x: x.t, y: x["vllm:num_requests_waiting"] ?? 0 }));
+  const completed = s.map(x => ({ x: x.t, y: x["vllm:e2e_request_latency_seconds_count"] ?? 0 }));
   const kvPct = s.map(x => ({ x: x.t, y: (x["vllm:kv_cache_usage_perc"] ?? 0) * 100 }));
 
   const throughput = [], ttft = [], itl = [];
@@ -291,7 +292,7 @@ function deriveRun(run) {
     preemptions: last["vllm:num_preemptions_total"] ?? 0,
   };
 
-  return { running, waiting, kvPct, throughput, ttft, itl, duration, kpis };
+  return { running, waiting, completed, kvPct, throughput, ttft, itl, duration, kpis };
 }
 
 function stepValueAt(points, x, eps) {
@@ -874,6 +875,7 @@ function init() {
       series: [
         { key: "running", label: "running", color: blue, points: d.running },
         { key: "waiting", label: "waiting", color: orange, points: d.waiting },
+        { key: "completed", label: "completed", color: aqua, points: d.completed },
       ],
       xDomain, yFmt: v => v.toFixed(0),
     }),
