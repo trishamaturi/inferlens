@@ -1,3 +1,4 @@
+<meta charset="utf-8">
 <title>vLLM Run Metrics</title>
 <style>
   :root {
@@ -76,12 +77,15 @@
      aggregate and per-query KPIs on waterfall hover never shifts the layout
      below it -- without this, growing the row pushes the waterfall you're
      hovering right out from under the cursor. */
-  .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; min-height: 184px; align-content: start; }
+  .kpi-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; min-height: 184px; align-content: start; }
   .kpi {
     background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
     padding: 12px 14px; box-shadow: var(--shadow);
   }
-  .kpi .label { font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted); }
+  .kpi .label {
+    font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
   .kpi .value { font-size: 24px; font-weight: 600; margin-top: 4px; color: var(--text-primary); }
   .kpi .unit { font-size: 13px; font-weight: 400; color: var(--text-secondary); margin-left: 3px; }
 
@@ -249,6 +253,31 @@ function detectStalls(req) {
   return stalls;
 }
 
+// ---- prefix-cache activity: vllm:prefix_cache_{queries,hits}_total are
+// cumulative run-wide counters, not per-request -- there's no span or API
+// field that attributes a cache hit to one request. Snapshotting the
+// counters at a request's submit/complete times and diffing gives its
+// *exact* share for a sequentially-fired run (see cache_test.py), and a
+// reasonable approximation (shared with whatever else was in flight) for a
+// concurrently-fired one.
+function sampleValueAt(samples, metricName, t) {
+  let val = 0;
+  for (const s of samples) {
+    if (s.t > t) break;
+    if (s[metricName] !== undefined) val = s[metricName];
+  }
+  return val;
+}
+
+function cacheStatsForRequest(req, samples) {
+  const q0 = sampleValueAt(samples, "vllm:prefix_cache_queries_total", req.submitted_t);
+  const q1 = sampleValueAt(samples, "vllm:prefix_cache_queries_total", req.completed_t);
+  const h0 = sampleValueAt(samples, "vllm:prefix_cache_hits_total", req.submitted_t);
+  const h1 = sampleValueAt(samples, "vllm:prefix_cache_hits_total", req.completed_t);
+  const queries = Math.max(0, q1 - q0), hits = Math.max(0, h1 - h0);
+  return { queries, hits, hitRatePct: queries > 0 ? (hits / queries) * 100 : null };
+}
+
 // ---- derive engine-aggregate series from raw cumulative samples ----
 function deriveRun(run) {
   const s = run.samples;
@@ -290,6 +319,9 @@ function deriveRun(run) {
       ? (last["vllm:inter_token_latency_seconds_sum"] / last["vllm:inter_token_latency_seconds_count"]) * 1000 : 0,
     peakKvPct: Math.max(0, ...s.map(x => (x["vllm:kv_cache_usage_perc"] ?? 0) * 100)),
     preemptions: last["vllm:num_preemptions_total"] ?? 0,
+    cacheQueries: last["vllm:prefix_cache_queries_total"] ?? 0,
+    cacheHitRatePct: (last["vllm:prefix_cache_queries_total"] ?? 0) > 0
+      ? ((last["vllm:prefix_cache_hits_total"] ?? 0) / last["vllm:prefix_cache_queries_total"]) * 100 : null,
   };
 
   return { running, waiting, completed, kvPct, throughput, ttft, itl, duration, kpis };
@@ -595,6 +627,11 @@ function renderAggregateKpis(d) {
   row.appendChild(kpiTile("Avg ITL", d.kpis.avgItlMs.toFixed(1), "ms"));
   row.appendChild(kpiTile("Peak KV cache", d.kpis.peakKvPct.toFixed(2), "%"));
   row.appendChild(kpiTile("Preemptions", d.kpis.preemptions.toFixed(0)));
+  row.appendChild(kpiTile(
+    "Prefix cache hit rate",
+    d.kpis.cacheHitRatePct !== null ? d.kpis.cacheHitRatePct.toFixed(1) : "—",
+    d.kpis.cacheHitRatePct !== null ? "%" : undefined,
+  ));
 }
 
 function renderQueryKpis(req) {
@@ -615,6 +652,11 @@ function renderQueryKpis(req) {
   row.appendChild(kpiTile("Completion tokens", req.completion_tokens ?? "—"));
   const throughput = req.completion_tokens && req.e2e_ms ? (req.completion_tokens / req.e2e_ms) * 1000 : null;
   row.appendChild(kpiTile("Throughput", throughput !== null ? throughput.toFixed(1) : "—", "tok/s"));
+  const cache = cacheStatsForRequest(req, RUN.samples);
+  row.appendChild(kpiTile(
+    "Prefix cache (req)",
+    cache.hitRatePct !== null ? `${cache.hits}/${cache.queries} (${cache.hitRatePct.toFixed(0)}%)` : "—",
+  ));
 }
 
 function renderSamplesTable(run) {
@@ -659,6 +701,10 @@ function renderRequestsTable(run) {
     ["e2e", r => fmtMs(r.e2e_ms)],
     ["prompt tok", r => r.prompt_tokens ?? "—"],
     ["completion tok", r => r.completion_tokens ?? "—"],
+    ["cache hit rate", r => {
+      const cache = cacheStatsForRequest(r, run.samples);
+      return cache.hitRatePct !== null ? `${cache.hitRatePct.toFixed(0)}%` : "—";
+    }],
     ["stalls (est.)", r => {
       const stalls = detectStalls(r);
       if (stalls.length === 0) return "—";
@@ -804,7 +850,8 @@ function renderWaterfall(run, onEnter, onLeave) {
     const y = margin.top + i * rowH + rowH / 2;
 
     const label = el("text", { class: "axis-label", x: 0, y: y + 4, "text-anchor": "start" });
-    label.textContent = `[${req.kind}] ${req.label}`.slice(0, 32);
+    const rawLabel = `[${req.kind}] ${req.label}`;
+    label.textContent = rawLabel.length > 32 ? rawLabel.slice(0, 31) + "…" : rawLabel;
     svg.appendChild(label);
 
     const t0 = req.submitted_t;
@@ -831,16 +878,27 @@ function renderWaterfall(run, onEnter, onLeave) {
           [req.first_token_t ?? t2, t2, decodeColor],
         ];
 
+    // All of a request's segments (and its stall markers) share one hover
+    // target -- pointerenter/pointerleave don't refire when the pointer
+    // moves between descendants of the same element, so grouping them here
+    // is what stops hovering across a segment boundary (e.g. prefill into
+    // decode) from flickering deactivate() (-> aggregate KPIs) and
+    // activate() (-> per-request KPIs) on every pixel crossed. Wiring each
+    // segment rect separately (the previous approach) fired exactly that
+    // flicker on every boundary, invisible in a still screenshot since
+    // each frame lands on a valid, self-consistent state.
+    const group = el("g", { tabindex: 0 });
+    group.addEventListener("pointerenter", () => activate(req, midX));
+    group.addEventListener("focus", () => activate(req, midX));
+    group.addEventListener("pointerleave", deactivate);
+    group.addEventListener("blur", deactivate);
+
     segments.forEach(([segStart, segEnd, color]) => {
       const rect = el("rect", {
         x: xScale(segStart), y: y - barH / 2, width: Math.max(1, xScale(segEnd) - xScale(segStart)), height: barH,
-        fill: color, rx: 3, tabindex: 0,
+        fill: color, rx: 3,
       });
-      rect.addEventListener("pointerenter", () => activate(req, midX));
-      rect.addEventListener("focus", () => activate(req, midX));
-      rect.addEventListener("pointerleave", deactivate);
-      rect.addEventListener("blur", deactivate);
-      svg.appendChild(rect);
+      group.appendChild(rect);
     });
 
     // token_times share the same clock as submitted_t/completed_t (both
@@ -850,10 +908,10 @@ function renderWaterfall(run, onEnter, onLeave) {
       const marker = el("rect", {
         class: "stall-marker", x: xScale(stall.t) - 1, y: y - barH / 2 - 2, width: 2, height: barH + 4,
       });
-      marker.addEventListener("pointerenter", () => activate(req, midX));
-      marker.addEventListener("pointerleave", deactivate);
-      svg.appendChild(marker);
+      group.appendChild(marker);
     });
+
+    svg.appendChild(group);
   });
 
   mount.appendChild(svg);

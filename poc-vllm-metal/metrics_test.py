@@ -233,8 +233,23 @@ def chat_job(messages: list[dict]) -> tuple[str, str, str, dict]:
     return "chat", label, "/v1/chat/completions", payload
 
 
-def run_all_queries(start_time: float, jobs: list[tuple[str, str, str, dict]]) -> list[dict]:
-    """Fires every job as its own concurrent streamed request."""
+def run_all_queries(
+    start_time: float, jobs: list[tuple[str, str, str, dict]], sequential: bool = False
+) -> list[dict]:
+    """Fires every job as its own streamed request -- concurrently by
+    default, or one at a time when `sequential` (needed to observe vLLM's
+    prefix cache actually reuse blocks a *prior* request already computed;
+    firing everything at once races every request's prefill in parallel
+    before any block is cached for a sibling to find -- see cache_test.py)."""
+    if sequential:
+        results = []
+        for kind, label, path, payload in jobs:
+            timing = stream_request(path, payload, start_time)
+            results.append({"request_id": str(uuid.uuid4()), "kind": kind, "label": label, **timing})
+            ttft = f"ttft={timing['ttft_ms']:.0f}ms " if timing["ttft_ms"] is not None else ""
+            print(f"  [{kind}] {label!r} -- {ttft}e2e={timing['e2e_ms']:.0f}ms")
+        return results
+
     results = []
     with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
         futures = {
@@ -260,10 +275,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def record_run(jobs: list[tuple[str, str, str, dict]], serve_args: list[str] | None = None) -> None:
+def record_run(
+    jobs: list[tuple[str, str, str, dict]], serve_args: list[str] | None = None, sequential: bool = False
+) -> None:
     """Starts vllm serve (with any extra `serve_args`), fires `jobs`
-    concurrently while recording, writes the run to the DB, and renders
-    dashboard.html."""
+    (concurrently, or one at a time if `sequential`) while recording,
+    writes the run to the DB, and renders dashboard.html."""
     otel_receiver = OtelSpanReceiver(OTEL_HOST, OTEL_PORT)
     otel_receiver.start()
 
@@ -279,10 +296,11 @@ def record_run(jobs: list[tuple[str, str, str, dict]], serve_args: list[str] | N
     try:
         print(f"Waiting for vllm serve to come up on {BASE_URL} ...")
         wait_for_server(proc)
-        print("Server is healthy. Starting metrics poller and firing all queries concurrently.")
+        mode = "sequentially" if sequential else "all queries concurrently"
+        print(f"Server is healthy. Starting metrics poller and firing {mode}.")
         poller.start(start_time)
 
-        results = run_all_queries(start_time, jobs)
+        results = run_all_queries(start_time, jobs, sequential=sequential)
 
         # A few extra samples so the tail of the run (post-request settling)
         # shows up in the chart too.
