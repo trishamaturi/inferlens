@@ -156,6 +156,7 @@ def stream_request(path: str, payload: dict, start_time: float) -> dict:
     time of every token."""
     submitted_t = time.monotonic() - start_time
     token_times: list[float] = []
+    text_parts: list[str] = []
     prompt_tokens = completion_tokens = None
     server_request_id = None
     is_chat = "chat" in path
@@ -178,6 +179,7 @@ def stream_request(path: str, payload: dict, start_time: float) -> dict:
                 )
                 if delta_text:
                     token_times.append(time.monotonic() - start_time)
+                    text_parts.append(delta_text)
             if chunk.get("usage"):
                 prompt_tokens = chunk["usage"]["prompt_tokens"]
                 completion_tokens = chunk["usage"]["completion_tokens"]
@@ -202,6 +204,7 @@ def stream_request(path: str, payload: dict, start_time: float) -> dict:
         "e2e_ms": e2e_ms,
         "token_times": token_times,
         "server_request_id": server_request_id,
+        "text": "".join(text_parts),
     }
 
 
@@ -265,6 +268,47 @@ def run_all_queries(
     return results
 
 
+def run_sessions(start_time: float, sessions: list[dict], max_tokens: int = 64) -> list[dict]:
+    """Fires `sessions` concurrently -- each session is its own sequential
+    chain of chat turns, where turn N's prompt includes the real assistant
+    reply `stream_request` captured from turn N-1 (see its `text` field).
+    This is the one request shape no other workload here produces: every
+    job in stress_test.py/cache_test.py/metrics_test.py is independent of
+    every other job's *output*, even when cache_test.py fires them one at
+    a time. An agent loop's defining property is that turn N can't even be
+    formed until turn N-1's real response comes back -- so within a
+    session, turns are strictly sequential; across sessions (concurrent
+    agents), they run in parallel. See agentic_workload.py."""
+    def run_session(session: dict) -> list[dict]:
+        messages = []
+        if session.get("system"):
+            messages.append({"role": "system", "content": session["system"]})
+        session_results = []
+        for turn_idx, user_text in enumerate(session["turns"], start=1):
+            messages.append({"role": "user", "content": user_text})
+            payload = {
+                "model": MODEL, "messages": messages, "temperature": 0.7,
+                "max_tokens": max_tokens, "stream": True,
+                "stream_options": {"include_usage": True},
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+            timing = stream_request("/v1/chat/completions", payload, start_time)
+            label = f"{session['label']} turn {turn_idx}/{len(session['turns'])}: {truncate(user_text, 40)}"
+            result = {"request_id": str(uuid.uuid4()), "kind": "agentic", "label": label, **timing}
+            session_results.append(result)
+            ttft = f"ttft={timing['ttft_ms']:.0f}ms " if timing["ttft_ms"] is not None else ""
+            print(f"  [agentic] {label!r} -- {ttft}e2e={timing['e2e_ms']:.0f}ms")
+            messages.append({"role": "assistant", "content": timing["text"]})
+        return session_results
+
+    results = []
+    with ThreadPoolExecutor(max_workers=len(sessions)) as pool:
+        futures = [pool.submit(run_session, s) for s in sessions]
+        for future in as_completed(futures):
+            results.extend(future.result())
+    return results
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -276,11 +320,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def record_run(
-    jobs: list[tuple[str, str, str, dict]], serve_args: list[str] | None = None, sequential: bool = False
+    jobs: list[tuple[str, str, str, dict]] | None, serve_args: list[str] | None = None,
+    sequential: bool = False, sessions: list[dict] | None = None, max_tokens: int = 64,
 ) -> None:
-    """Starts vllm serve (with any extra `serve_args`), fires `jobs`
-    (concurrently, or one at a time if `sequential`) while recording,
-    writes the run to the DB, and renders dashboard.html."""
+    """Starts vllm serve (with any extra `serve_args`), fires work while
+    recording, writes the run to the DB, and renders dashboard.html. Work
+    is either `jobs` (concurrently, or one at a time if `sequential`) or,
+    if `sessions` is given instead, concurrent agent-loop sessions of
+    sequential turns (see run_sessions) -- `jobs` is ignored when
+    `sessions` is passed."""
     otel_receiver = OtelSpanReceiver(OTEL_HOST, OTEL_PORT)
     otel_receiver.start()
 
@@ -296,11 +344,17 @@ def record_run(
     try:
         print(f"Waiting for vllm serve to come up on {BASE_URL} ...")
         wait_for_server(proc)
-        mode = "sequentially" if sequential else "all queries concurrently"
+        if sessions is not None:
+            mode = f"{len(sessions)} concurrent agent sessions (sequential turns within each)"
+        else:
+            mode = "sequentially" if sequential else "all queries concurrently"
         print(f"Server is healthy. Starting metrics poller and firing {mode}.")
         poller.start(start_time)
 
-        results = run_all_queries(start_time, jobs, sequential=sequential)
+        if sessions is not None:
+            results = run_sessions(start_time, sessions, max_tokens=max_tokens)
+        else:
+            results = run_all_queries(start_time, jobs, sequential=sequential)
 
         # A few extra samples so the tail of the run (post-request settling)
         # shows up in the chart too.
