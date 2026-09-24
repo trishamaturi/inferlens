@@ -72,6 +72,26 @@
   .toolbar { font-size: 13px; color: var(--text-secondary); }
   .toolbar strong { color: var(--text-primary); font-weight: 600; }
 
+  /* Correlation rules (correlate.py) attribute *why* something happened
+     (e.g. "queued behind a 3000-word request") instead of just reporting
+     that it did -- shown here, above the KPI tiles, so it reads as the
+     diagnosis for whatever's currently in scope (run aggregate or one
+     hovered request). Fixed height and always rendered (never
+     display:none, never sized by content) for the same reason kpi-row
+     has a fixed min-height: this box sits above kpi-row, so if its size
+     depended on how many correlations the current request has, switching
+     between requests with 0/1/2 correlations would shift the waterfall
+     chart below it right out from under a stationary cursor -- the exact
+     bug min-height on kpi-row was added to fix. */
+  .correlation-note {
+    margin-bottom: 12px; padding: 10px 14px; height: 58px; overflow: hidden;
+    background: var(--surface-1); border: 1px solid var(--border); border-left: 3px solid var(--series-orange);
+    border-radius: 6px; font-size: 13px; color: var(--text-secondary);
+  }
+  .correlation-note .corr-item { padding: 2px 0; }
+  .correlation-note .corr-item::before { content: "→ "; color: var(--series-orange); }
+  .correlation-note .corr-empty { color: var(--text-muted); font-style: italic; }
+
   /* min-height reserves room for the largest KPI-row state (query view with
      an OTel phase breakdown, which wraps to two rows) so switching between
      aggregate and per-query KPIs on waterfall hover never shifts the layout
@@ -157,6 +177,8 @@
   <div class="toolbar">
     <span>Showing: <strong id="scope-badge">all queries (run aggregate)</strong></span>
   </div>
+
+  <div class="correlation-note" id="correlation-note"></div>
 
   <div class="kpi-row" id="kpi-row"></div>
 
@@ -616,7 +638,26 @@ function kpiTile(label, value, unit) {
   return div;
 }
 
+function renderCorrelationNote(items) {
+  const note = document.getElementById("correlation-note");
+  note.innerHTML = "";
+  if (!items || items.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "corr-empty";
+    empty.textContent = "No notable correlations for this view.";
+    note.appendChild(empty);
+    return;
+  }
+  items.forEach(text => {
+    const div = document.createElement("div");
+    div.className = "corr-item";
+    div.textContent = text;
+    note.appendChild(div);
+  });
+}
+
 function renderAggregateKpis(d) {
+  renderCorrelationNote(RUN.correlations);
   const row = document.getElementById("kpi-row");
   row.innerHTML = "";
   row.appendChild(kpiTile("Peak concurrency", d.kpis.peakConcurrency.toFixed(0), "reqs"));
@@ -635,6 +676,7 @@ function renderAggregateKpis(d) {
 }
 
 function renderQueryKpis(req) {
+  renderCorrelationNote(req.correlations);
   const row = document.getElementById("kpi-row");
   row.innerHTML = "";
   row.appendChild(kpiTile("Kind", req.kind));

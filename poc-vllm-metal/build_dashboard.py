@@ -15,6 +15,7 @@ import argparse
 import json
 from pathlib import Path
 
+import correlate
 import metrics_db
 
 TEMPLATE_PATH = Path(__file__).parent / "dashboard_template.html"
@@ -71,10 +72,15 @@ def build_payload(run_id: str | None, db_path: Path) -> dict:
         }
         for r in request_rows
     ]
+    samples_ = pivot_samples(sample_rows)
+    for req in requests_:
+        req["correlations"] = correlate.annotate_request(req, requests_, samples_)
+
     return {
         "run": {"run_id": run_id, "model": model, "started_at": started_at, "duration_s": duration_s},
-        "samples": pivot_samples(sample_rows),
+        "samples": samples_,
         "requests": requests_,
+        "correlations": correlate.annotate_run(samples_),
     }
 
 
