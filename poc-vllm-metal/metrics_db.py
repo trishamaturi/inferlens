@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY,
     model TEXT NOT NULL,
     started_at TEXT NOT NULL,
-    duration_s REAL NOT NULL
+    duration_s REAL NOT NULL,
+    max_num_seqs INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS requests (
@@ -82,13 +83,22 @@ CREATE INDEX IF NOT EXISTS idx_otel_spans_request ON otel_spans(gen_ai_request_i
 def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
+    try:
+        # CREATE TABLE IF NOT EXISTS doesn't add columns to a table that
+        # already exists from before this column was introduced.
+        conn.execute("ALTER TABLE runs ADD COLUMN max_num_seqs INTEGER")
+    except sqlite3.OperationalError:
+        pass
     return conn
 
 
-def insert_run(conn: sqlite3.Connection, run_id: str, model: str, started_at: str, duration_s: float) -> None:
+def insert_run(
+    conn: sqlite3.Connection, run_id: str, model: str, started_at: str, duration_s: float,
+    max_num_seqs: int | None = None,
+) -> None:
     conn.execute(
-        "INSERT INTO runs (run_id, model, started_at, duration_s) VALUES (?, ?, ?, ?)",
-        (run_id, model, started_at, duration_s),
+        "INSERT INTO runs (run_id, model, started_at, duration_s, max_num_seqs) VALUES (?, ?, ?, ?, ?)",
+        (run_id, model, started_at, duration_s, max_num_seqs),
     )
 
 
@@ -142,7 +152,7 @@ def latest_run_id(conn: sqlite3.Connection) -> str | None:
 
 def fetch_run(conn: sqlite3.Connection, run_id: str):
     run = conn.execute(
-        "SELECT run_id, model, started_at, duration_s FROM runs WHERE run_id = ?", (run_id,)
+        "SELECT run_id, model, started_at, duration_s, max_num_seqs FROM runs WHERE run_id = ?", (run_id,)
     ).fetchone()
     if run is None:
         raise ValueError(f"No run {run_id!r} found")

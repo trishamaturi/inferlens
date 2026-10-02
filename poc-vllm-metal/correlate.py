@@ -120,6 +120,29 @@ def preemption_kv_threshold(samples: list[dict]) -> str | None:
     )
 
 
+def poor_batching_packing(samples: list[dict], max_num_seqs: int | None) -> str | None:
+    """Rule: did concurrency plateau below the *configured* scheduler cap
+    while requests were still queueing -- i.e. was KV cache capacity the
+    real bottleneck, not --max-num-seqs? Needs the configured cap itself
+    (metrics_db.runs.max_num_seqs, recorded per-run since this rule can't
+    tell "the scheduler is under-packing" from "there was never enough
+    concurrent load to test it" without knowing what the cap actually
+    was)."""
+    if not max_num_seqs or not samples:
+        return None
+    peak_running = max((s.get("vllm:num_requests_running") or 0) for s in samples)
+    peak_waiting = max((s.get("vllm:num_requests_waiting") or 0) for s in samples)
+    if peak_waiting == 0:
+        return None  # no queueing pressure at all -- nothing to explain
+    if peak_running >= max_num_seqs:
+        return None  # scheduler actually reached its configured cap -- that's good packing, not this failure mode
+    return (
+        f"Concurrency never reached the configured cap (--max-num-seqs {max_num_seqs}) -- "
+        f"peaked at {peak_running:.0f} running while {peak_waiting:.0f} requests queued, "
+        f"so KV cache capacity was the real bottleneck, not the scheduler's sequence-count cap"
+    )
+
+
 def annotate_request(request: dict, all_requests: list[dict], samples: list[dict]) -> list[str]:
     """All per-request correlation rules for one request, in priority order."""
     return [
@@ -130,6 +153,11 @@ def annotate_request(request: dict, all_requests: list[dict], samples: list[dict
     ]
 
 
-def annotate_run(samples: list[dict]) -> list[str]:
+def annotate_run(samples: list[dict], max_num_seqs: int | None = None) -> list[str]:
     """All run-level correlation rules."""
-    return [c for c in [preemption_kv_threshold(samples)] if c]
+    return [
+        c for c in [
+            preemption_kv_threshold(samples),
+            poor_batching_packing(samples, max_num_seqs),
+        ] if c
+    ]

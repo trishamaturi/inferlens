@@ -376,10 +376,15 @@ def record_run(
 
     duration_s = max((t for t, _ in poller.samples), default=0.0)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+    max_num_seqs = None
+    if serve_args and "--max-num-seqs" in serve_args:
+        max_num_seqs = int(serve_args[serve_args.index("--max-num-seqs") + 1])
 
     conn = metrics_db.connect()
     with conn:
-        metrics_db.insert_run(conn, run_id, MODEL, datetime.now(timezone.utc).isoformat(), duration_s)
+        metrics_db.insert_run(
+            conn, run_id, MODEL, datetime.now(timezone.utc).isoformat(), duration_s, max_num_seqs
+        )
         for result in results:
             metrics_db.insert_request(conn, run_id, result)
             metrics_db.insert_request_tokens(conn, result["request_id"], result["token_times"])

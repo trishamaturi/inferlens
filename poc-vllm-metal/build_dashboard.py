@@ -56,7 +56,7 @@ def build_payload(run_id: str | None, db_path: Path) -> dict:
     finally:
         conn.close()
 
-    _, model, started_at, duration_s = run
+    _, model, started_at, duration_s, max_num_seqs = run
     requests_ = [
         {
             "request_id": r[0], "kind": r[1], "label": r[2], "submitted_t": r[3],
@@ -77,10 +77,13 @@ def build_payload(run_id: str | None, db_path: Path) -> dict:
         req["correlations"] = correlate.annotate_request(req, requests_, samples_)
 
     return {
-        "run": {"run_id": run_id, "model": model, "started_at": started_at, "duration_s": duration_s},
+        "run": {
+            "run_id": run_id, "model": model, "started_at": started_at, "duration_s": duration_s,
+            "max_num_seqs": max_num_seqs,
+        },
         "samples": samples_,
         "requests": requests_,
-        "correlations": correlate.annotate_run(samples_),
+        "correlations": correlate.annotate_run(samples_, max_num_seqs),
     }
 
 
