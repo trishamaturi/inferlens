@@ -5,66 +5,52 @@ of the inference stack (vLLM, TGI, SGLang, Triton, etc.) — curated views and
 cross-signal correlation, purpose-built for inference-serving internals rather
 than generic metrics/logs/traces.
 
-Status: personal project, pre-code, design phase.
+Status: personal project. Phase 0 done, Phase 1 mostly done, Phase 3 started
+(ahead of Phase 2, which is blocked on GPU access). See §5.
 
 ## 1. Landscape check (what already exists)
 
-Raw metric scraping and dashboarding for model servers is already solved and
-commodity — not worth rebuilding:
+Raw metric scraping/dashboarding for model servers is commodity — not worth
+rebuilding:
 
-- vLLM ships a `/metrics` Prometheus endpoint (queue depth, KV cache %,
-  running/waiting/swapped counts, TTFT, etc.) and native OTel request tracing
-  via `--otlp-traces-endpoint`.
+- vLLM ships a `/metrics` Prometheus endpoint and native OTel tracing via
+  `--otlp-traces-endpoint`.
   ([vLLM metrics docs](https://docs.vllm.ai/en/stable/design/metrics/))
-- Grafana, Parseable, and OpenObserve all ship ready-made "point at vLLM's
-  `/metrics`" dashboards.
-  ([Grafana vLLM dashboard](https://grafana.com/grafana/dashboards/25263-vllm-metrics/))
+- Grafana, Parseable, and OpenObserve all ship ready-made vLLM dashboards.
 
 ## 2. The actual gap / wedge
 
-Metrics and traces are collected but never correlated — and nobody diagnoses
-*why* an agentic, multi-session workload behaves the way it does. Today's
-inference-serving deployments aren't single-request benchmarks — they're many
-concurrent sessions/clients (agent loops, multi-turn chats, batch jobs)
-sharing a scheduler, a KV cache, and a fixed pool of GPUs. vLLM exposes both
-`kv_cache_usage_perc` and per-request OTel spans, but today you'd view them in
-two different tools (a metrics dashboard, a trace viewer) and eyeball the
-correlation yourself. Nobody answers questions like:
+Metrics and traces are collected but never correlated — nobody diagnoses *why*
+a multi-session workload behaves the way it does. Concurrent sessions share a
+scheduler, a KV cache, and a fixed GPU pool; vLLM exposes the signals, but
+today you'd eyeball the correlation yourself across two separate tools.
+Example questions nobody answers:
 
-- "Why did this short request stall — was it queued behind a half-million-
-  token context request hogging the batch?"
-- "Why did this MoE request spike in latency — was its expert evicted from
-  GPU memory and reloaded?"
-- "Is our KV cache actually being used well, or are a few hot experts/paths
-  dominating while the rest sits idle?"
-- "Are tensor-parallel / expert-parallel shards actually balanced, or is one
-  GPU a straggler?"
-- "Did throughput drop because request mix changed, or because a GPU quietly
-  throttled (power/thermal) and tokens/sec dropped independent of load?"
+- Was this short request queued behind a huge-context request hogging the batch?
+- Is KV cache well-utilized, or are a few hot paths dominating while the rest idles?
+- Did throughput drop because of request mix, or a throttling GPU?
 
 **Positioning:** diagnose *why* a multi-session inference workload is
 slow/inefficient, by correlating traces and metrics purpose-built for
-model-serving internals.
+model-serving internals — not another raw-metrics dashboard.
 
-**Why this matters:** throughput (tokens/sec) and latency (TTFT, ITL) on a
-fixed GPU fleet are a direct cost lever — a 10% efficiency gain is a 10%
-GPU-hour saving at scale. Failure modes compound quietly (e.g. verbose model
-output filling context windows faster than expected, degrading batching and
-cache efficiency in ways a plain "requests/sec" dashboard won't show).
+## 3. Diagnostic catalog
 
-## 3. Diagnostic catalog: failure modes this should surface
+Four of seven failure modes are confirmed against real recorded runs
+(`vllm-metal/`, Qwen3-0.6B on Apple Silicon/Metal):
 
-Parking lot for now — better to derive the actual failure-mode list from what
-metrics/traces really get surfaced once something is running, rather than
-speculate upfront. Rough areas to revisit against real data:
-
-- Scheduling & batching fairness (e.g. long-context requests starving short
-  ones)
-- MoE expert routing/eviction/load balance
-- Tensor/expert parallelism health (comms overhead, stragglers)
-- Cache reuse across multi-turn sessions
-- GPU hardware health (throttling, power draw)
-- Workload ↔ infra mismatch (agentic loops, autoscaling lag, wrong routing)
+- **Scheduling & batching fairness** ✅ — short requests stagger in admission
+  waves behind concurrent load, purely from queueing, not prefill cost.
+- **Preemption** ✅ — only reproducible once KV cache is deliberately shrunk
+  (`--num-gpu-blocks-override`); the default pool is oversized for this model.
+- **Cache reuse across multi-turn sessions** ✅ — needs sequential firing to
+  observe (concurrent firing races every prefill before a block is cached);
+  hit rate climbs from 0% cold to ~99% on verbatim repeats.
+- **Workload ↔ infra mismatch (agentic loops)** ✅ — concurrent sessions of
+  *dependent* sequential turns reproduce real cross-agent queueing and show
+  organic (not synthetic) cache reuse from growing context.
+- MoE load balance, tensor/expert parallelism, GPU hardware health — not
+  testable on this single-GPU, dense-model, Metal setup.
 
 ## 4. Proposed architecture
 
@@ -102,59 +88,70 @@ speculate upfront. Rough areas to revisit against real data:
                                           └───────────────────────────┘
 ```
 
-The ingest pipeline, concretely:
-1. **Metrics** land in the TSDB on a fixed poll interval (e.g. every 5s).
-2. **Traces** land in the trace store as spans arrive (event-driven, not
-   polled).
-3. **Correlation** joins the two by time window + `request_id`/session — this
-   can also mean metric-to-metric correlation (e.g. power draw vs.
-   tokens/sec), not only trace-to-metric.
-4. Findings surface as annotations on the waterfall/dashboard views, not just
-   raw alerts.
-
 Concrete tech choices (collection protocol, storage engine, backend language,
 UI framework) are TBD — better decided once the high-level design above is
 settled, not locked in now.
 
 ## 5. Phased roadmap
 
-1. **Phase 0 — vLLM-only.** Scrape `/metrics`, ingest OTLP traces, canonical
-   schema v0, one "golden signals" dashboard (TTFT, ITL, tok/s, queue depth,
-   KV cache %, GPU util via nvidia-smi/DCGM).
-2. **Phase 1 — Request waterfall view.** Click a slow request, see its full
-   span tree plus the metric timeline around it (e.g. "KV cache hit 96%,
-   preempted twice"). Use this to start filling in the diagnostic catalog
-   (§3) from real signal.
-3. **Phase 2 — Second engine adapter** (TGI or SGLang) to pressure-test the
-   canonical schema.
-4. **Phase 3 — Correlation rules / alerting** for the failure modes found in
-   §3, rather than generic threshold alerts.
-5. **Phase 4 — Fleet view.** Multi-replica/multi-model view, cost/token
-   overlay.
+1. **Phase 0 — vLLM-only.** ✅ Done. `/metrics` scraping, OTLP trace ingest,
+   golden-signals dashboard. Gaps: no GPU-util metric (no Metal-native
+   nvidia-smi/DCGM equivalent); storage schema is vLLM-shaped only so far.
+2. **Phase 1 — Request waterfall view.** 🚧 Mostly done. Per-request
+   queue/prefill/decode waterfall, preemption-stall heuristic, prefix-cache
+   hit rate. 4 of 7 §3 catalog entries confirmed; the rest need hardware this
+   setup doesn't have.
+3. **Phase 2 — Second engine adapter** (TGI/SGLang). ⏸ Blocked — both are
+   CUDA-only; this box only runs vLLM via its Metal backend. Needs real GPU
+   access first (e.g. a university compute cluster or hourly rentals).
+4. **Phase 3 — Correlation rules.** 🚧 Started out of order (ahead of the
+   blocked Phase 2). `correlate.py` has 3 rules: large-context starvation
+   attribution, preemption confirmed against a KV threshold, and poor
+   batching packing (KV-bound vs. seq-count-bound concurrency). 2 more rules
+   (MoE, pipeline bubbles) stay deferred — need hardware this setup doesn't
+   have.
+5. **Phase 4 — Fleet view.** Not started. Multi-replica/multi-model view,
+   cost/token overlay.
+
+## 6. Observing an already-running instance
+
+Every script below starts its own `vllm serve` and fires synthetic traffic.
+`observe.py` instead points at an instance you already have running with real
+traffic — no server start, no synthetic requests:
+
+```
+./run_observe.sh --host <host> --port <port> [--otlp-port 4318] [--duration SECONDS]
+```
+
+Requires the target to have been started with `--otlp-traces-endpoint`
+pointing at `observe.py`'s receiver (can't attach after the fact — needs a
+restart). Without it: metrics-only, no waterfall. Observed requests also have
+no prompt text and no stall heuristic (both need being the streaming client).
 
 ## Files
 
-Under `poc-vllm-metal/` (run from that directory):
+Under `vllm-metal/` (run from that directory):
 
-- `basic_test.py` — offline smoke test: loads the model in-process (no server)
-  and runs a few raw-text prompts (`.generate()`) and chat conversations
-  (`.chat()`). Also defines `MODEL`, `RAW_PROMPTS` and `CONVERSATIONS`, which
-  the other scripts reuse.
-- `metrics_test.py` — starts `vllm serve`, fires the `basic_test.py` prompts
-  concurrently as streamed requests, and records engine `/metrics` samples,
-  per-request TTFT/ITL/e2e and per-token times, and vLLM's OTel spans into
-  `vllm_metrics.db`, then renders `dashboard.html`. `record_run()` is the shared
-  recorder.
-- `stress_test.py` — same recording via `record_run()`, but with a
-  scheduler-overloading workload (many short requests plus long-context
-  "hogs" under a low `--max-num-seqs`) to produce real queueing/KV-pressure
-  signal.
-- `run.sh` — activates the vllm-metal venv and runs `basic_test.py`.
-- `run_metrics.sh` — activates the venv, records a run with `metrics_test.py`,
-  and builds `dashboard.html`. Flag: `[--max-num-seqs N]`.
-- `run_stress.sh` — same as `run_metrics.sh` but runs `stress_test.py`, a
-  scheduler-overloading mix (many short requests plus long-context "hogs" under
-  a low `--max-num-seqs`) that produces real queueing/KV-pressure signal.
-  Flags: see `stress_test.py --help`.
-- `run_dashboard.sh` — activates the venv and re-renders `dashboard.html` from
-  recorded data via `build_dashboard.py`, without recording. Flag: `[--run-id ID]`.
+- `basic_test.py` — offline smoke test (no server): raw-text and chat
+  completions via `.generate()`/`.chat()`. Defines `MODEL`, `RAW_PROMPTS`,
+  `CONVERSATIONS`, reused by the other scripts.
+- `metrics_test.py` — starts `vllm serve`, fires requests, records
+  `/metrics` samples, per-request timing, and OTel spans into
+  `vllm_metrics.db`, then renders `dashboard.html`. `record_run()` is the
+  shared recorder used by every script below.
+- `stress_test.py` — scheduler-overloading workload (short requests + long
+  "hogs") for real queueing/KV-pressure. `--num-gpu-blocks-override` forces
+  real preemption.
+- `cache_test.py` / `cache_workload.py` — fires a shared prompt prefix
+  sequentially to get real prefix-cache hit-rate signal.
+- `agentic_test.py` / `agentic_workload.py` — concurrent sessions, each a
+  sequential chain of chat turns depending on the model's real prior reply.
+- `correlate.py` — Phase 3 correlation rules, folded into the dashboard
+  payload. See §5.
+- `observe.py` — observes an already-running instance instead of starting
+  one. See §6.
+- `run.sh` / `run_metrics.sh` / `run_stress.sh` / `run_cache.sh` /
+  `run_agentic.sh` / `run_observe.sh` — venv-activating wrappers for the
+  scripts above; see each script's `--help`.
+- `run_dashboard.sh` — re-renders `dashboard.html` from recorded data
+  without recording. Flag: `[--run-id ID]`.

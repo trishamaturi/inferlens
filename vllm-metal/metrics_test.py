@@ -98,8 +98,9 @@ def parse_metrics(text: str) -> dict[str, float]:
 class MetricsPoller:
     """Scrapes /metrics on a background thread until stopped."""
 
-    def __init__(self, interval_sec: float) -> None:
+    def __init__(self, interval_sec: float, base_url: str = BASE_URL) -> None:
         self._interval_sec = interval_sec
+        self._base_url = base_url
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self.samples: list[tuple[float, dict]] = []
@@ -108,7 +109,7 @@ class MetricsPoller:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                resp = requests.get(f"{BASE_URL}/metrics", timeout=2)
+                resp = requests.get(f"{self._base_url}/metrics", timeout=2)
                 resp.raise_for_status()
                 values = parse_metrics(resp.text)
                 t = round(time.monotonic() - self._start_time, 3)
@@ -205,6 +206,49 @@ def stream_request(path: str, payload: dict, start_time: float) -> dict:
         "token_times": token_times,
         "server_request_id": server_request_id,
         "text": "".join(text_parts),
+    }
+
+
+def span_to_request(span: dict, run_start_wall_ns: int) -> dict:
+    """Builds the same per-request dict shape stream_request() returns, but
+    from a passively-observed OTel "llm_request" span (see observe.py)
+    instead of from streaming the response ourselves -- used when we
+    didn't fire the request, so there's no client-side stopwatch or
+    per-token arrival times to record. vLLM's own span already carries
+    prompt/completion token counts and the full latency breakdown (see
+    otel_receiver.py), which is everything stream_request() gets from the
+    API response -- except the prompt text itself (spans never carry it,
+    reasonably) and token_times (only observable by being the client).
+
+    `run_start_wall_ns` is a wall-clock reference (time.time_ns()) captured
+    at the same moment the run's MetricsPoller started, so span timestamps
+    land on the same zero-based "seconds since run start" axis as
+    poller.samples' `t` values -- a POC-level approximation (no NTP-style
+    skew correction) that's fine for a local target, less so for a
+    remote one with real clock drift."""
+    attrs = span["attributes"]
+    start_s = (span["start_time_unix_nano"] - run_start_wall_ns) / 1e9
+    end_s = (span["end_time_unix_nano"] - run_start_wall_ns) / 1e9
+    ttft_s = attrs.get("gen_ai.latency.time_to_first_token")
+    decode_s = attrs.get("gen_ai.latency.time_in_model_decode")
+    e2e_s = attrs.get("gen_ai.latency.e2e")
+    completion_tokens = attrs.get("gen_ai.usage.completion_tokens")
+    return {
+        "submitted_t": start_s,
+        "first_token_t": start_s + ttft_s if ttft_s is not None else None,
+        "completed_t": end_s,
+        "prompt_tokens": attrs.get("gen_ai.usage.prompt_tokens"),
+        "completion_tokens": completion_tokens,
+        "ttft_ms": ttft_s * 1000 if ttft_s is not None else None,
+        "itl_ms": (
+            decode_s * 1000 / (completion_tokens - 1)
+            if decode_s is not None and completion_tokens and completion_tokens > 1
+            else None
+        ),
+        "e2e_ms": e2e_s * 1000 if e2e_s is not None else (end_s - start_s) * 1000,
+        "token_times": [],
+        "server_request_id": attrs.get("gen_ai.request.id"),
+        "text": "",
     }
 
 

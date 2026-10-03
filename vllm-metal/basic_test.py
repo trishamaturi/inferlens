@@ -17,8 +17,6 @@ Or via the helper script from this directory:
     ./run.sh
 """
 
-from vllm import LLM, SamplingParams
-
 # Small enough to run comfortably in 16GB of unified memory on an M4.
 MODEL = "Qwen/Qwen3-0.6B"
 
@@ -42,6 +40,14 @@ CONVERSATIONS = [
 
 
 def main() -> None:
+    # Deferred to here, not module level: every other script in this
+    # directory (metrics_test.py and everything built on it) imports this
+    # module just for MODEL/RAW_PROMPTS/CONVERSATIONS, and vLLM's own
+    # import + platform-plugin discovery takes ~18s -- a cost observe.py
+    # in particular can't afford to pay before it starts listening (see
+    # its own docstring on the startup-race this caused).
+    from vllm import LLM, SamplingParams
+
     llm = LLM(model=MODEL)
     sampling_params = SamplingParams(temperature=0.7, max_tokens=64)
 
